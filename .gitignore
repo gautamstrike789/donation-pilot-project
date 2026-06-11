@@ -4,4 +4,5 @@ __pycache__/
 client_secret.json
 token.pickle
 sheets_config.json
+tmo-donation-form-*.json
 *.pyc
