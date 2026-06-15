@@ -258,6 +258,7 @@ st.markdown(
 #  Session state
 # --------------------------------------------------------------------------- #
 st.session_state.setdefault("nonce", 0)
+st.session_state.setdefault("ba_nonce", 0)
 st.session_state.setdefault("rows", [0])
 st.session_state.setdefault("next_id", 1)
 st.session_state.setdefault("session_entries", [])
@@ -265,6 +266,7 @@ st.session_state.setdefault("new_bas", {})
 st.session_state.setdefault("pending_preview", [])    # validated rows awaiting confirm (accumulates across BAs)
 st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the Admin sheet, written on Submit
 n = st.session_state.nonce
+bn = st.session_state.ba_nonce
 
 
 def parse_age_value(raw_age):
@@ -331,7 +333,7 @@ ba_sel_label = st.selectbox(
     index=None,
     placeholder=ba_ph,
     disabled=(not code) or new_name_typed,
-    key=f"ba_{n}_{code or 'x'}",
+    key=f"ba_{bn}_{code or 'x'}",
 )
 ba_sel = None if new_name_typed else (label_to_name.get(ba_sel_label) if ba_sel_label else None)
 
@@ -465,7 +467,8 @@ if save_clicked:
             already = {(o, nm.lower()) for o, _c, nm in st.session_state.pending_new_bas}
             if (code, effective_ba.lower()) not in already:
                 st.session_state.pending_new_bas.append((code, cd, effective_ba))
-        # clear the form for the next BA: keep owner code (and sign-in date), reset everything else
+        # clear for the next batch: keep owner code, sign-in date, and BA name;
+        # reset only the "add a new BA" fields and the donation rows
         st.session_state.nonce += 1
         st.session_state.rows = [st.session_state.next_id]
         st.session_state.next_id += 1
@@ -524,6 +527,7 @@ if st.session_state.pending_preview:
                 st.session_state.pending_preview = []
                 st.session_state.pending_new_bas = []
                 st.session_state.nonce += 1
+                st.session_state.ba_nonce += 1
                 st.session_state.rows = [st.session_state.next_id]
                 st.session_state.next_id += 1
                 st.rerun()
