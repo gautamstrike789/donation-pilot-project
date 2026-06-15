@@ -54,9 +54,18 @@ st.set_page_config(
 # --------------------------------------------------------------------------- #
 #  Google OAuth + Sheets connection
 # --------------------------------------------------------------------------- #
+def _has_secret(section):
+    """Safely check for a secrets section. Returns False when no secrets.toml
+    exists (e.g. local runs), instead of raising StreamlitSecretNotFoundError."""
+    try:
+        return section in st.secrets
+    except Exception:  # noqa: BLE001 — no secrets file / not configured
+        return False
+
+
 def get_credentials():
     """Load cached OAuth token, refresh if expired, or prompt re-auth."""
-    if SERVICE_ACCOUNT_SECTION in st.secrets:
+    if _has_secret(SERVICE_ACCOUNT_SECTION):
         return ServiceAccountCredentials.from_service_account_info(
             dict(st.secrets[SERVICE_ACCOUNT_SECTION]),
             scopes=SCOPES,
@@ -89,7 +98,7 @@ def get_gc():
 
 
 def load_config():
-    if SECRETS_SECTION in st.secrets:
+    if _has_secret(SECRETS_SECTION):
         secret_cfg = st.secrets[SECRETS_SECTION]
         return {
             "admin_sheet_id": secret_cfg["admin_sheet_id"],
@@ -100,7 +109,7 @@ def load_config():
 
 
 def cloud_secrets_ready():
-    return SERVICE_ACCOUNT_SECTION in st.secrets and SECRETS_SECTION in st.secrets
+    return _has_secret(SERVICE_ACCOUNT_SECTION) and _has_secret(SECRETS_SECTION)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,9 +262,8 @@ st.session_state.setdefault("rows", [0])
 st.session_state.setdefault("next_id", 1)
 st.session_state.setdefault("session_entries", [])
 st.session_state.setdefault("new_bas", {})
-st.session_state.setdefault("pending_preview", None)  # validated rows awaiting confirm
-st.session_state.setdefault("pending_is_new", False)
-st.session_state.setdefault("pending_ba_info", {})    # cd, effective_ba, code for new-BA write
+st.session_state.setdefault("pending_preview", [])    # validated rows awaiting confirm (accumulates across BAs)
+st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the Admin sheet, written on Submit
 n = st.session_state.nonce
 
 
@@ -300,6 +308,10 @@ for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
     combined[nm_] = cd_
 for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
     combined.setdefault(nm_, cd_)
+if code:
+    for owner_c, cd_, nm_ in st.session_state.pending_new_bas:
+        if owner_c == code:
+            combined.setdefault(nm_, cd_)
 ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
 ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
 label_to_name = {(f"{nm_}  ·  {cd_}" if cd_ else nm_): nm_ for nm_, cd_ in ba_pairs}
@@ -397,6 +409,7 @@ if save_clicked:
         cd = ""
     existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
     existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
+    existing_lower |= {nm_.lower() for owner_c, cd_, nm_ in st.session_state.pending_new_bas if owner_c == code}
     is_new, effective_ba = False, ""
     if nm:
         effective_ba = nm
@@ -437,28 +450,40 @@ if save_clicked:
                                "BAName": effective_ba, "BACode": row_code,
                                "Amount(Amt)": amt, "Age": age, "SOD": sod})
 
+    if not errors and not valid_rows:
+        errors.append("Add at least one donation (amount, age, source) before saving.")
+
     if errors:
         for e in errors:
             st.error(e)
-        st.session_state.pending_preview = None
+        # keep whatever is already staged in the preview; just don't add this invalid batch
     else:
-        # store validated rows for preview (NOT saved yet)
-        st.session_state.pending_preview = valid_rows
-        st.session_state.pending_is_new = is_new
-        st.session_state.pending_ba_info = {"cd": cd, "effective_ba": effective_ba, "code": code}
+        # accumulate validated rows into the running preview (NOT saved to Sheets yet)
+        st.session_state.pending_preview.extend(valid_rows)
+        # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
+        if is_new and effective_ba:
+            already = {(o, nm.lower()) for o, _c, nm in st.session_state.pending_new_bas}
+            if (code, effective_ba.lower()) not in already:
+                st.session_state.pending_new_bas.append((code, cd, effective_ba))
+        # clear the form for the next BA: keep owner code (and sign-in date), reset everything else
+        st.session_state.nonce += 1
+        st.session_state.rows = [st.session_state.next_id]
+        st.session_state.next_id += 1
+        st.rerun()
 
 # --------------------------------------------------------------------------- #
 #  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
 # --------------------------------------------------------------------------- #
 if st.session_state.pending_preview:
     preview = st.session_state.pending_preview
-    ba_info = st.session_state.pending_ba_info
+    staged_new = st.session_state.pending_new_bas
+    ba_count = len({(r["OWNCODE"], r["BAName"]) for r in preview})
 
     st.divider()
     st.subheader("📋 Preview — review before submitting")
     st.info(
-        f"**{len(preview)} entry(s)** for **{ba_info['effective_ba']}** under owner **{ba_info['code']}** — "
-        "not saved yet. Click **Submit** to confirm."
+        f"**{len(preview)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
+        "Add more BAs with **Save all entries**, or click **Submit** to write them all."
     )
     st.dataframe(pd.DataFrame(preview)[HEADERS], use_container_width=True, hide_index=True)
 
@@ -467,36 +492,37 @@ if st.session_state.pending_preview:
     cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
 
     if cancel_clicked:
-        st.session_state.pending_preview = None
+        st.session_state.pending_preview = []
+        st.session_state.pending_new_bas = []
         st.rerun()
 
     if submit_clicked:
         ok_to_save = True
-        is_new = st.session_state.pending_is_new
-        cd = ba_info["cd"]
-        effective_ba = ba_info["effective_ba"]
-        owner_code = ba_info["code"]
 
-        if is_new:
+        # 1) register any staged new BAs in the Admin sheet first
+        if staged_new:
             try:
-                if cd and cd != "Unassigned" and cd in A["ba_codes"]:
-                    st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
-                append_bas([(owner_code, cd, effective_ba)])
+                for owner_code, cd, effective_ba in staged_new:
+                    if cd and cd != "Unassigned" and cd in A["ba_codes"]:
+                        st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
+                append_bas([(o, cd, nm) for o, cd, nm in staged_new])
                 load_admin.clear()
-                st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
-                st.success(f"➕ New BA **{effective_ba}** ({cd}) added to Admin sheet under owner **{owner_code}**.")
+                for owner_code, cd, effective_ba in staged_new:
+                    st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
+                added = ", ".join(f"{nm} ({cd})" for _o, cd, nm in staged_new)
+                st.success(f"➕ New BA(s) added to Admin sheet: {added}")
             except Exception as e:  # noqa: BLE001
                 ok_to_save = False
                 st.error(f"Couldn't update Admin sheet: {e}")
 
+        # 2) write all donations
         if ok_to_save:
             try:
                 append_donations(preview)
                 st.session_state.session_entries.extend(preview)
-                st.success(f"✅ Submitted **{len(preview)}** donation(s) for **{effective_ba}** → Donations sheet")
-                st.session_state.pending_preview = None
-                st.session_state.pending_is_new = False
-                st.session_state.pending_ba_info = {}
+                st.success(f"✅ Submitted **{len(preview)}** donation(s) across **{ba_count}** BA(s) → Donations sheet")
+                st.session_state.pending_preview = []
+                st.session_state.pending_new_bas = []
                 st.session_state.nonce += 1
                 st.session_state.rows = [st.session_state.next_id]
                 st.session_state.next_id += 1
