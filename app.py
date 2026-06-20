@@ -174,20 +174,32 @@ def load_admin():
 
 def _append_with_retry(ws, rows, max_attempts=6):
     """Append rows, retrying on 429 rate-limit with exponential backoff.
-    Waits 1 → 2 → 4 → 8 → 16 s between attempts; raises only if all fail."""
-    for attempt in range(max_attempts):
-        try:
-            ws.append_rows(rows, value_input_option="RAW")
-            return
-        except gspread.exceptions.APIError as e:
-            is_rate_limit = (
-                (hasattr(e, "response") and e.response.status_code == 429)
-                or "429" in str(e)
-            )
-            if is_rate_limit and attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)  # 1, 2, 4, 8, 16 s
-            else:
-                raise
+    Shows a visible warning to the user during each wait, then clears it
+    automatically when the retry succeeds. Waits 1→2→4→8→16 s."""
+    notice = st.empty()
+    try:
+        for attempt in range(max_attempts):
+            try:
+                ws.append_rows(rows, value_input_option="RAW")
+                return
+            except gspread.exceptions.APIError as e:
+                is_rate_limit = (
+                    (hasattr(e, "response") and e.response.status_code == 429)
+                    or "429" in str(e)
+                )
+                if is_rate_limit and attempt < max_attempts - 1:
+                    wait = 2 ** attempt  # 1, 2, 4, 8, 16 s
+                    notice.warning(
+                        f"High traffic detected — your data is safe and will be saved "
+                        f"in {wait} second{'s' if wait > 1 else ''}. "
+                        f"Please do not close this tab. "
+                        f"(Retry {attempt + 1} of {max_attempts - 1})"
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+    finally:
+        notice.empty()  # clear the warning once done (success or final failure)
 
 
 def append_bas(new_rows):
