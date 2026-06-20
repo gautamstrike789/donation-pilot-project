@@ -20,6 +20,7 @@ Run:
 import json
 import os
 import pickle
+import time
 from datetime import date
 from io import BytesIO
 
@@ -171,18 +172,36 @@ def load_admin():
             "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes}
 
 
+def _append_with_retry(ws, rows, max_attempts=6):
+    """Append rows, retrying on 429 rate-limit with exponential backoff.
+    Waits 1 → 2 → 4 → 8 → 16 s between attempts; raises only if all fail."""
+    for attempt in range(max_attempts):
+        try:
+            ws.append_rows(rows, value_input_option="RAW")
+            return
+        except gspread.exceptions.APIError as e:
+            is_rate_limit = (
+                (hasattr(e, "response") and e.response.status_code == 429)
+                or "429" in str(e)
+            )
+            if is_rate_limit and attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)  # 1, 2, 4, 8, 16 s
+            else:
+                raise
+
+
 def append_bas(new_rows):
     """new_rows: list of (OWNCODE, BACode, BAName) -> appended to the BAs worksheet."""
     cfg = load_config()
     ws = get_ws(cfg["admin_sheet_id"], "_ws_bas", "BAs")
-    ws.append_rows([list(r) for r in new_rows], value_input_option="RAW")
+    _append_with_retry(ws, [list(r) for r in new_rows])
 
 
 def append_donations(rows):
     """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet."""
     cfg = load_config()
     ws = get_ws(cfg["donations_sheet_id"], "_ws_donations", 0)
-    ws.append_rows([[r[h] for h in HEADERS] for r in rows], value_input_option="RAW")
+    _append_with_retry(ws, [[r[h] for h in HEADERS] for r in rows])
 
 
 def session_xlsx_bytes(entries):
