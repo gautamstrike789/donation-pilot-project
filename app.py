@@ -172,10 +172,10 @@ def load_admin():
             "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes}
 
 
-def _append_with_retry(ws, rows, max_attempts=6):
+def _append_with_retry(ws, rows, max_attempts=8):
     """Append rows, retrying on 429 rate-limit with exponential backoff.
     Shows a visible warning to the user during each wait, then clears it
-    automatically when the retry succeeds. Waits 1→2→4→8→16 s."""
+    automatically when the retry succeeds. Waits 1→2→4→8→16→32→64 s (127s max)."""
     notice = st.empty()
     try:
         for attempt in range(max_attempts):
@@ -193,7 +193,8 @@ def _append_with_retry(ws, rows, max_attempts=6):
                         f"High traffic detected — your data is safe and will be saved "
                         f"in {wait} second{'s' if wait > 1 else ''}. "
                         f"Please do not close this tab. "
-                        f"(Retry {attempt + 1} of {max_attempts - 1})"
+                        f"(Retry {attempt + 1} of {max_attempts - 1}, "
+                        f"max wait {2 ** (max_attempts - 1) - 1}s)"
                     )
                     time.sleep(wait)
                 else:
