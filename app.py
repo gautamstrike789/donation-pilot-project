@@ -97,6 +97,15 @@ def get_gc():
     return st.session_state.gc
 
 
+def get_ws(sheet_id, cache_key, ws_selector):
+    """Return a cached worksheet — avoids a read-quota hit on every submit."""
+    if cache_key not in st.session_state:
+        gc = get_gc()
+        sh = gc.open_by_key(sheet_id)
+        st.session_state[cache_key] = sh.sheet1 if ws_selector == 0 else sh.worksheet(ws_selector)
+    return st.session_state[cache_key]
+
+
 def load_config():
     if _has_secret(SECRETS_SECTION):
         secret_cfg = st.secrets[SECRETS_SECTION]
@@ -165,18 +174,14 @@ def load_admin():
 def append_bas(new_rows):
     """new_rows: list of (OWNCODE, BACode, BAName) -> appended to the BAs worksheet."""
     cfg = load_config()
-    gc = get_gc()
-    sh = gc.open_by_key(cfg["admin_sheet_id"])
-    ws = sh.worksheet("BAs")
+    ws = get_ws(cfg["admin_sheet_id"], "_ws_bas", "BAs")
     ws.append_rows([list(r) for r in new_rows], value_input_option="RAW")
 
 
 def append_donations(rows):
     """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet."""
     cfg = load_config()
-    gc = get_gc()
-    sh = gc.open_by_key(cfg["donations_sheet_id"])
-    ws = sh.sheet1
+    ws = get_ws(cfg["donations_sheet_id"], "_ws_donations", 0)
     ws.append_rows([[r[h] for h in HEADERS] for r in rows], value_input_option="RAW")
 
 
