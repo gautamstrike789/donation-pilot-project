@@ -172,10 +172,20 @@ def load_admin():
             "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes}
 
 
-def _append_with_retry(ws, rows, max_attempts=8):
-    """Append rows, retrying on 429 rate-limit with exponential backoff.
-    Shows a visible warning to the user during each wait, then clears it
-    automatically when the retry succeeds. Waits 1→2→4→8→16→32→64 s (127s max)."""
+def _get_status_code(e):
+    """Extract HTTP status code from a gspread APIError."""
+    if hasattr(e, "response") and hasattr(e.response, "status_code"):
+        return e.response.status_code
+    for code in (429, 401, 403, 500, 503):
+        if str(code) in str(e):
+            return code
+    return None
+
+
+def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
+    """Append rows with exponential backoff for 429 (rate limit) and
+    automatic session reset for 401/403 (expired token).
+    cache_keys: tuple of session_state keys to clear on auth failure."""
     notice = st.empty()
     try:
         for attempt in range(max_attempts):
@@ -183,12 +193,9 @@ def _append_with_retry(ws, rows, max_attempts=8):
                 ws.append_rows(rows, value_input_option="RAW")
                 return
             except gspread.exceptions.APIError as e:
-                is_rate_limit = (
-                    (hasattr(e, "response") and e.response.status_code == 429)
-                    or "429" in str(e)
-                )
-                if is_rate_limit and attempt < max_attempts - 1:
-                    wait = 2 ** attempt  # 1, 2, 4, 8, 16 s
+                code = _get_status_code(e)
+                if code == 429 and attempt < max_attempts - 1:
+                    wait = 2 ** attempt  # 1, 2, 4, 8, 16, 32, 64 s
                     notice.warning(
                         f"High traffic detected — your data is safe and will be saved "
                         f"in {wait} second{'s' if wait > 1 else ''}. "
@@ -197,24 +204,42 @@ def _append_with_retry(ws, rows, max_attempts=8):
                         f"max wait {2 ** (max_attempts - 1) - 1}s)"
                     )
                     time.sleep(wait)
+                elif code in (401, 403) and attempt == 0:
+                    # Token expired mid-session: drop cached gc + worksheet and retry once
+                    notice.warning("Re-authenticating with Google — please wait a moment...")
+                    for k in ("gc", *cache_keys):
+                        st.session_state.pop(k, None)
+                    creds = get_credentials()
+                    st.session_state.gc = gspread.authorize(creds)
+                    cfg = load_config()
+                    # Rebuild whichever worksheet we're writing to
+                    for ck in cache_keys:
+                        if ck == "_ws_donations":
+                            sh = st.session_state.gc.open_by_key(cfg["donations_sheet_id"])
+                            st.session_state[ck] = sh.sheet1
+                            ws = st.session_state[ck]
+                        elif ck == "_ws_bas":
+                            sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
+                            st.session_state[ck] = sh.worksheet("BAs")
+                            ws = st.session_state[ck]
                 else:
                     raise
     finally:
-        notice.empty()  # clear the warning once done (success or final failure)
+        notice.empty()
 
 
 def append_bas(new_rows):
     """new_rows: list of (OWNCODE, BACode, BAName) -> appended to the BAs worksheet."""
     cfg = load_config()
     ws = get_ws(cfg["admin_sheet_id"], "_ws_bas", "BAs")
-    _append_with_retry(ws, [list(r) for r in new_rows])
+    _append_with_retry(ws, [list(r) for r in new_rows], cache_keys=("_ws_bas",))
 
 
 def append_donations(rows):
     """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet."""
     cfg = load_config()
     ws = get_ws(cfg["donations_sheet_id"], "_ws_donations", 0)
-    _append_with_retry(ws, [[r[h] for h in HEADERS] for r in rows])
+    _append_with_retry(ws, [[r[h] for h in HEADERS] for r in rows], cache_keys=("_ws_donations",))
 
 
 def session_xlsx_bytes(entries):
