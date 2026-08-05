@@ -135,12 +135,6 @@ def cloud_secrets_ready():
     return _has_secret(SERVICE_ACCOUNT_SECTION) and _has_secret(SECRETS_SECTION)
 
 
-def donations_sheet_url():
-    """The exact Google Sheet this app writes to — open this to verify your data."""
-    cfg = load_config()
-    return f"https://docs.google.com/spreadsheets/d/{cfg[DONATIONS_SHEET_KEY]}"
-
-
 # --------------------------------------------------------------------------- #
 #  Read dropdown data from the Admin Google Sheet (cached 2 min)
 # --------------------------------------------------------------------------- #
@@ -611,14 +605,13 @@ if st.session_state.pending_preview:
                 if added < len(preview):
                     # The API returned success but fewer rows than expected landed.
                     st.warning(
-                        f"Expected to add {len(preview)} row(s) but the sheet grew by {added}. "
-                        f"Check the Donations One-Off sheet directly: {donations_sheet_url()}"
+                        f"Expected to add {len(preview)} row(s) but only {added} landed. "
+                        "Please contact the admin to verify your data was saved correctly."
                     )
-                st.session_state.flash_success = (
-                    f"✅ Submitted {len(preview)} entry(s) across {ba_count} BA(s). "
-                    f"The Donations One-Off sheet now holds {after} data row(s). "
-                    f"Open it to verify → {donations_sheet_url()}"
-                )
+                else:
+                    st.session_state.flash_success = (
+                        f"✅ Submitted {len(preview)} entry(s) across {ba_count} BA(s)."
+                    )
                 st.session_state.pending_preview = []
                 st.session_state.pending_new_bas = []
                 st.session_state.nonce += 1
@@ -635,7 +628,6 @@ if st.session_state.pending_preview:
                         "**Editor** access to the right account (your Google login locally, or the "
                         "service-account email on Streamlit Cloud)."
                     )
-                st.caption(f"Target sheet: {donations_sheet_url()}")
 
 # --------------------------------------------------------------------------- #
 #  Submitted entries (this session) + downloads
