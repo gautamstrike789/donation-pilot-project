@@ -373,10 +373,6 @@ if os.path.exists(LOGO_FILE):
 hc2.title("Donation Entry — One-Off")
 hc2.caption(f"{len(A['label_by_code'])} owners · {total_bas:,} BAs · source: Google Sheets")
 
-# Persistent confirmation that survives the post-submit rerun.
-if st.session_state.get("flash_success"):
-    st.success(st.session_state.pop("flash_success"))
-
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
     "1 · Owner Code (OWNCODE) *",
@@ -646,3 +642,7 @@ if se:
     )
 else:
     st.info("Entries you save in this session will appear here, updating live as you submit.")
+
+# Confirmation shown last, at the very bottom, right after the submitted-entries list.
+if st.session_state.get("flash_success"):
+    st.success(st.session_state.pop("flash_success"))
