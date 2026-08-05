@@ -10,6 +10,20 @@ python setup.py
 python -m streamlit run app.py
 ```
 
+## One-Off form
+
+`app_oneoff.py` is a second, independent form that reuses the same Admin sheet
+(Owners/BAs) but writes to its own "TMO Donations One-Off" sheet with columns
+`SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS`. ADS (Supports ÷ Forms)
+is calculated automatically, not entered by the user.
+
+```powershell
+python -m pip install -r requirements.txt
+python setup.py            # if you haven't already
+python setup_oneoff.py     # one-time: creates the Donations One-Off sheet
+python -m streamlit run app_oneoff.py
+```
+
 ## Deploy on Streamlit Community Cloud
 
 This app supports Streamlit Cloud by reading Google Sheets settings and Google service account credentials from Streamlit secrets.
@@ -38,6 +52,24 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/your-s
 
 4. Share the Google Sheets used by the app with the service account email.
 5. Redeploy.
+
+### Deploying the One-Off form
+
+Deploy `app_oneoff.py` as its own separate Streamlit Community Cloud app (same
+GitHub repo, main file `app_oneoff.py`). It has its own independent secrets store
+— add:
+
+```toml
+[google_sheets]
+admin_sheet_id = "your-admin-sheet-id"
+oneoff_donations_sheet_id = "your-oneoff-donations-sheet-id"
+
+[gcp_service_account]
+# same service account block as above
+```
+
+Share the Admin sheet and the "TMO Donations One-Off" sheet with that service
+account's email.
 
 ## Notes
 
