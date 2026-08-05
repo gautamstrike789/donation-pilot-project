@@ -379,16 +379,9 @@ if os.path.exists(LOGO_FILE):
 hc2.title("Donation Entry — One-Off")
 hc2.caption(f"{len(A['label_by_code'])} owners · {total_bas:,} BAs · source: Google Sheets")
 
-# Persistent confirmation that survives the post-submit rerun, plus the exact
-# sheet this app writes to — open it to confirm you're looking at the right file.
+# Persistent confirmation that survives the post-submit rerun.
 if st.session_state.get("flash_success"):
     st.success(st.session_state.pop("flash_success"))
-with st.expander("📄 Where does Submit save? (click to verify)"):
-    st.markdown(f"All submissions are written to this sheet → [{donations_sheet_url()}]({donations_sheet_url()})")
-    st.caption(
-        "If your entries don't appear, make sure THIS is the sheet you have open. "
-        "Running `setup_oneoff.py` more than once creates extra sheets with the same name."
-    )
 
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
@@ -452,8 +445,7 @@ with st.container(border=True):
 
 # ---- 5) Entries (dynamic rows) ----
 st.markdown("#### Entries")
-st.caption("Add one or more entries for this BA, then save them all at once. "
-           "ADS (Supports ÷ Forms) is calculated automatically.")
+st.caption("Add one or more entries for this BA, then save them all at once.")
 
 row_inputs = []
 to_remove = None
