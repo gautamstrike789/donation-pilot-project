@@ -3,9 +3,9 @@ Donation Entry — One-Off Owner submission portal (Streamlit + Google Sheets)
 =============================================================================
 Form order:  Owner Code  →  SignIn Date  →  BA Name  →  Add-new-BA  →  Entries (+ rows)
 
-Data source: same Admin sheet as the main donation form, configured via
-sheets_config.json (created by setup.py / extended by setup_oneoff.py):
-    • Admin sheet          — worksheets "Owners" (OWNCODE|OwnerName|City) and "BAs" (OWNCODE|BACode|BAName)
+Data source: its own dedicated sheets, independent from the main donation form,
+configured via sheets_config.json (created by setup_oneoff.py):
+    • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|City) and "BAs" (OWNCODE|BACode|BAName)
     • Donations One-Off sheet — one worksheet with columns:
         SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS
 
@@ -16,8 +16,8 @@ Uses OAuth (your Google account) — no service account keys needed.
 
 Run:
     python -m pip install -r requirements.txt
-    python setup.py            # one-time: creates Admin + Donations sheets + config (if not already done)
-    python setup_oneoff.py     # one-time: creates the Donations One-Off sheet + extends config
+    python setup.py            # one-time: signs in with your Google account
+    python setup_oneoff.py     # one-time: creates the Admin + Donations One-Off sheets + extends config
     python -m streamlit run app_oneoff.py
 """
 
@@ -42,6 +42,7 @@ CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token.pickle"
 SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
+ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
 HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Forms", "Supports", "ADS"]
 ADS_DECIMALS = 1
@@ -116,16 +117,16 @@ def load_config():
     if _has_secret(SECRETS_SECTION):
         secret_cfg = st.secrets[SECRETS_SECTION]
         return {
-            "admin_sheet_id": secret_cfg["admin_sheet_id"],
+            ADMIN_SHEET_KEY: secret_cfg[ADMIN_SHEET_KEY],
             DONATIONS_SHEET_KEY: secret_cfg[DONATIONS_SHEET_KEY],
         }
     with open(CONFIG_FILE) as f:
         cfg = json.load(f)
-    if DONATIONS_SHEET_KEY not in cfg:
+    if ADMIN_SHEET_KEY not in cfg or DONATIONS_SHEET_KEY not in cfg:
         st.error(
-            f"**{DONATIONS_SHEET_KEY}** missing from {CONFIG_FILE}. "
-            "Run **`python setup_oneoff.py`** first to create the Donations One-Off "
-            "sheet and extend the config file."
+            f"**{ADMIN_SHEET_KEY}** / **{DONATIONS_SHEET_KEY}** missing from {CONFIG_FILE}. "
+            "Run **`python setup_oneoff.py`** first to create the Admin One-Off and "
+            "Donations One-Off sheets and extend the config file."
         )
         st.stop()
     return cfg
@@ -142,7 +143,7 @@ def cloud_secrets_ready():
 def load_admin():
     cfg = load_config()
     gc = get_gc()
-    sh = gc.open_by_key(cfg["admin_sheet_id"])
+    sh = gc.open_by_key(cfg[ADMIN_SHEET_KEY])
 
     def sheet_rows(ws_name):
         values = sh.worksheet(ws_name).get_all_values()
@@ -232,7 +233,7 @@ def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
                             st.session_state[ck] = sh.sheet1
                             ws = st.session_state[ck]
                         elif ck == "_ws_bas":
-                            sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
+                            sh = st.session_state.gc.open_by_key(cfg[ADMIN_SHEET_KEY])
                             st.session_state[ck] = sh.worksheet("BAs")
                             ws = st.session_state[ck]
                 else:
@@ -244,7 +245,7 @@ def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
 def append_bas(new_rows):
     """new_rows: list of (OWNCODE, BACode, BAName) -> appended to the BAs worksheet."""
     cfg = load_config()
-    ws = get_ws(cfg["admin_sheet_id"], "_ws_bas", "BAs")
+    ws = get_ws(cfg[ADMIN_SHEET_KEY], "_ws_bas", "BAs")
     _append_with_retry(ws, [list(r) for r in new_rows], cache_keys=("_ws_bas",))
 
 

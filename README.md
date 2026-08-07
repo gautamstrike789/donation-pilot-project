@@ -12,15 +12,17 @@ python -m streamlit run app.py
 
 ## One-Off form
 
-`app_oneoff.py` is a second, independent form that reuses the same Admin sheet
-(Owners/BAs) but writes to its own "TMO Donations One-Off" sheet with columns
+`app_oneoff.py` is a second, fully independent form with its own Admin sheet
+("TMO Admin One-Off", uploaded from `TMO Admin One-Off.xlsx`) and its own
+Donations sheet ("TMO Donations One-Off") with columns
 `SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS`. ADS (Supports ÷ Forms)
-is calculated automatically, not entered by the user.
+is calculated automatically, not entered by the user. It does not share any
+sheet with the main donation form.
 
 ```powershell
 python -m pip install -r requirements.txt
-python setup.py            # if you haven't already
-python setup_oneoff.py     # one-time: creates the Donations One-Off sheet
+python setup.py            # if you haven't already (signs in with your Google account)
+python setup_oneoff.py     # one-time: creates the Admin + Donations One-Off sheets
 python -m streamlit run app_oneoff.py
 ```
 
@@ -61,15 +63,15 @@ GitHub repo, main file `app_oneoff.py`). It has its own independent secrets stor
 
 ```toml
 [google_sheets]
-admin_sheet_id = "your-admin-sheet-id"
+oneoff_admin_sheet_id = "your-oneoff-admin-sheet-id"
 oneoff_donations_sheet_id = "your-oneoff-donations-sheet-id"
 
 [gcp_service_account]
 # same service account block as above
 ```
 
-Share the Admin sheet and the "TMO Donations One-Off" sheet with that service
-account's email.
+Share the "TMO Admin One-Off" sheet and the "TMO Donations One-Off" sheet with
+that service account's email.
 
 ## Notes
 

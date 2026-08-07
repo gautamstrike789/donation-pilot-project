@@ -7,3 +7,4 @@ token.pickle
 sheets_config.json
 tmo-donation-form-*.json
 *.pyc
+*.xlsx

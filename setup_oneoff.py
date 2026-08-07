@@ -1,14 +1,19 @@
 """
 setup_oneoff.py — One-time setup for the One-Off Donation Entry app (OAuth version)
 =====================================================================================
-Reuses the existing Admin sheet (Owners/BAs) created by setup.py, and creates a new
-"TMO Donations One-Off" Google Sheet for app_oneoff.py to write to. Extends the
-existing sheets_config.json with the new sheet's ID — admin_sheet_id and
-donations_sheet_id (from setup.py) are left untouched.
+Creates two Google Sheets dedicated to the One-Off form (fully independent from the
+main donation form's "TMO Admin" / "TMO Donations" sheets):
+    • "TMO Admin One-Off"      — uploaded from ADMIN_XLSX ("Owners" + "BAs" sheets)
+    • "TMO Donations One-Off"  — one worksheet with columns:
+        SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS
+
+Extends sheets_config.json with oneoff_admin_sheet_id / oneoff_donations_sheet_id.
+Each step is idempotent — it's skipped if its key is already present in the config.
 
 Prerequisites:
-    1. You've already run `python setup.py` at least once (sheets_config.json and
-       token.pickle must already exist).
+    1. You've already run `python setup.py` at least once (token.pickle must exist).
+    2. ADMIN_XLSX ("TMO Admin One-Off.xlsx") is present in this folder, with "Owners"
+       and "BAs" sheets in the same column order as the main admin.xlsx.
 
 Run once:
     python setup_oneoff.py
@@ -31,8 +36,10 @@ except ImportError:
 CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token.pickle"
 CONFIG_FILE = "sheets_config.json"
+ADMIN_XLSX = "TMO Admin One-Off.xlsx"
+ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Forms", "Supports", "ADS"]
+DONATIONS_HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Forms", "Supports", "ADS"]
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -61,44 +68,89 @@ def get_credentials():
     return creds
 
 
+def save_config(config):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def create_admin_sheet(gc, config):
+    if ADMIN_SHEET_KEY in config:
+        print(f"'{ADMIN_SHEET_KEY}' already present in {CONFIG_FILE}:")
+        print(f"  https://docs.google.com/spreadsheets/d/{config[ADMIN_SHEET_KEY]}")
+        print("Delete that key from the config file first if you want to create a fresh sheet.\n")
+        return
+    if not os.path.exists(ADMIN_XLSX):
+        print(f"ERROR: {ADMIN_XLSX} not found in this folder — can't create the Admin One-Off sheet.")
+        sys.exit(1)
+
+    import pandas as pd
+    print("Creating 'TMO Admin One-Off' Google Sheet...")
+    admin_sh = gc.create("TMO Admin One-Off")
+
+    owners_ws = admin_sh.sheet1
+    owners_ws.update_title("Owners")
+    owners_ws.update([["OWNCODE", "OwnerName", "City"]], value_input_option="RAW")
+    bas_ws = admin_sh.add_worksheet("BAs", rows=1000, cols=3)
+    bas_ws.update([["OWNCODE", "BACode", "BAName"]], value_input_option="RAW")
+
+    print(f"Uploading data from {ADMIN_XLSX}...")
+    owners_df = pd.read_excel(ADMIN_XLSX, sheet_name="Owners", dtype=str).fillna("")
+    bas_df = pd.read_excel(ADMIN_XLSX, sheet_name="BAs", dtype=str).fillna("")
+
+    batch = 2000
+    if len(owners_df):
+        rows = owners_df.values.tolist()
+        for i in range(0, len(rows), batch):
+            owners_ws.append_rows(rows[i:i + batch], value_input_option="RAW")
+        print(f"  Owners: {len(owners_df)} rows uploaded")
+
+    if len(bas_df):
+        rows = bas_df.values.tolist()
+        for i in range(0, len(rows), batch):
+            bas_ws.append_rows(rows[i:i + batch], value_input_option="RAW")
+        print(f"  BAs: {len(bas_df)} rows uploaded")
+
+    config[ADMIN_SHEET_KEY] = admin_sh.id
+    save_config(config)
+    print(f"  Sheet ID: {admin_sh.id}\n")
+
+
+def create_donations_sheet(gc, config):
+    if DONATIONS_SHEET_KEY in config:
+        print(f"'{DONATIONS_SHEET_KEY}' already present in {CONFIG_FILE}:")
+        print(f"  https://docs.google.com/spreadsheets/d/{config[DONATIONS_SHEET_KEY]}")
+        print("Delete that key from the config file first if you want to create a fresh sheet.\n")
+        return
+
+    print("Creating 'TMO Donations One-Off' Google Sheet...")
+    don_sh = gc.create("TMO Donations One-Off")
+    don_ws = don_sh.sheet1
+    don_ws.update_title("Donations One-Off")
+    don_ws.update([DONATIONS_HEADERS], value_input_option="RAW")
+
+    config[DONATIONS_SHEET_KEY] = don_sh.id
+    save_config(config)
+    print(f"  Sheet ID: {don_sh.id}\n")
+
+
 def main():
     if not os.path.exists(CONFIG_FILE):
         print(f"ERROR: {CONFIG_FILE} not found. Run `python setup.py` first.")
         sys.exit(1)
     with open(CONFIG_FILE) as f:
         config = json.load(f)
-    if "admin_sheet_id" not in config:
-        print(f"ERROR: 'admin_sheet_id' missing from {CONFIG_FILE}. Run `python setup.py` first.")
-        sys.exit(1)
-    if DONATIONS_SHEET_KEY in config:
-        print(f"'{DONATIONS_SHEET_KEY}' already present in {CONFIG_FILE}:")
-        print(f"  https://docs.google.com/spreadsheets/d/{config[DONATIONS_SHEET_KEY]}")
-        print("Delete that key from the config file first if you want to create a fresh sheet.")
-        sys.exit(0)
 
     print("Authenticating with your Google account...\n")
     creds = get_credentials()
     gc = gspread.authorize(creds)
     print("Signed in successfully!\n")
 
-    print("Creating 'TMO Donations One-Off' Google Sheet...")
-    don_sh = gc.create("TMO Donations One-Off")
-    don_ws = don_sh.sheet1
-    don_ws.update_title("Donations One-Off")
-    don_ws.update([HEADERS], value_input_option="RAW")
+    create_admin_sheet(gc, config)
+    create_donations_sheet(gc, config)
 
-    # Save the config immediately after creation succeeds, before any further
-    # output — a print() encoding error here must not lose track of the new sheet.
-    config[DONATIONS_SHEET_KEY] = don_sh.id
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"  Sheet ID: {don_sh.id}")
-    print(f"\nConfig updated: {CONFIG_FILE}")
-
-    print("\n" + "=" * 60)
+    print("=" * 60)
     print("SETUP COMPLETE!")
     print("=" * 60)
-    print(f"\n  Donations One-Off sheet: https://docs.google.com/spreadsheets/d/{don_sh.id}")
     print(f"\n  To start the app:  python -m streamlit run app_oneoff.py")
 
 
