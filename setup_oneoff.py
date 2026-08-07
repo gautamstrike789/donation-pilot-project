@@ -3,9 +3,11 @@ setup_oneoff.py — One-time setup for the One-Off Donation Entry app (OAuth ver
 =====================================================================================
 Creates two Google Sheets dedicated to the One-Off form (fully independent from the
 main donation form's "TMO Admin" / "TMO Donations" sheets):
-    • "TMO Admin One-Off"      — uploaded from ADMIN_XLSX ("Owners" + "BAs" sheets)
+    • "TMO Admin One-Off"      — uploaded from ADMIN_XLSX ("Owners" + "BAs" sheets).
+      An OWNCODE can appear on multiple Owners rows with a different Client
+      (e.g. HAI, STC) — each row is its own selectable entry in the form.
     • "TMO Donations One-Off"  — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS
+        SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS
 
 Extends sheets_config.json with oneoff_admin_sheet_id / oneoff_donations_sheet_id.
 Each step is idempotent — it's skipped if its key is already present in the config.
@@ -39,7 +41,7 @@ CONFIG_FILE = "sheets_config.json"
 ADMIN_XLSX = "TMO Admin One-Off.xlsx"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-DONATIONS_HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Forms", "Supports", "ADS"]
+DONATIONS_HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "Forms", "Supports", "ADS"]
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -89,7 +91,7 @@ def create_admin_sheet(gc, config):
 
     owners_ws = admin_sh.sheet1
     owners_ws.update_title("Owners")
-    owners_ws.update([["OWNCODE", "OwnerName", "City"]], value_input_option="RAW")
+    owners_ws.update([["OWNCODE", "OwnerName", "Client"]], value_input_option="RAW")
     bas_ws = admin_sh.add_worksheet("BAs", rows=1000, cols=3)
     bas_ws.update([["OWNCODE", "BACode", "BAName"]], value_input_option="RAW")
 

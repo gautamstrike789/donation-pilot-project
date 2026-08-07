@@ -5,9 +5,11 @@ Form order:  Owner Code  →  SignIn Date  →  BA Name  →  Add-new-BA  →  E
 
 Data source: its own dedicated sheets, independent from the main donation form,
 configured via sheets_config.json (created by setup_oneoff.py):
-    • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|City) and "BAs" (OWNCODE|BACode|BAName)
+    • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|Client) and "BAs" (OWNCODE|BACode|BAName).
+      An OWNCODE can have multiple Owners rows with a different Client (e.g. HAI,
+      STC) — each is its own selectable entry; picking one sets both together.
     • Donations One-Off sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Forms, Supports, ADS
+        SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS
 
 ADS (Average Donation per Support) is calculated automatically as
 Supports / Forms — it is not a form input.
@@ -44,7 +46,7 @@ SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Forms", "Supports", "ADS"]
+HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "Forms", "Supports", "ADS"]
 ADS_DECIMALS = 1
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -155,17 +157,22 @@ def load_admin():
     owners_rows = sheet_rows("Owners")
     bas_rows = sheet_rows("BAs")
 
-    label_by_code, code_by_label, owner_meta = {}, {}, {}
+    # Every (OWNCODE, Client) row is its own dropdown entry — the same owner
+    # code can appear multiple times with a different Client (e.g. HAI, STC),
+    # and selecting one picks both the owner and the client together.
+    owner_labels, label_to_owner, owner_codes = [], {}, set()
     for r in owners_rows:
         c = str(r.get("OWNCODE", "")).strip()
         if not c:
             continue
-        meta = " — ".join(p for p in [str(r.get("OwnerName", "")).strip(),
-                                      str(r.get("City", "")).strip()] if p)
+        name = str(r.get("OwnerName", "")).strip()
+        client = str(r.get("Client", "")).strip()
+        meta = " — ".join(p for p in [name, client] if p)
         label = f"{c}  ·  {meta}" if meta else c
-        label_by_code[c] = label
-        code_by_label[label] = c
-        owner_meta[c] = (str(r.get("OwnerName", "")).strip(), str(r.get("City", "")).strip())
+        if label not in label_to_owner:
+            owner_labels.append(label)
+            label_to_owner[label] = (c, client)
+        owner_codes.add(c)
 
     ba_by_code, ba_codes = {}, set()
     for r in bas_rows:
@@ -182,8 +189,8 @@ def load_admin():
     for c in ba_by_code:
         ba_by_code[c] = sorted(ba_by_code[c], key=lambda t: t[0].lower())
 
-    return {"label_by_code": label_by_code, "code_by_label": code_by_label,
-            "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes}
+    return {"owner_labels": owner_labels, "label_to_owner": label_to_owner,
+            "owner_count": len(owner_codes), "ba_by_code": ba_by_code, "ba_codes": ba_codes}
 
 
 def _get_status_code(e):
@@ -372,17 +379,17 @@ hc1, hc2 = st.columns([1, 4], vertical_alignment="center")
 if os.path.exists(LOGO_FILE):
     hc1.image(LOGO_FILE, width=130)
 hc2.title("Donation Entry — One-Off")
-hc2.caption(f"{len(A['label_by_code'])} owners · {total_bas:,} BAs · source: Google Sheets")
+hc2.caption(f"{A['owner_count']} owners · {total_bas:,} BAs · source: Google Sheets")
 
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
     "1 · Owner Code (OWNCODE) *",
-    list(A["label_by_code"].values()),
+    A["owner_labels"],
     index=None,
     placeholder="Search your owner code…",
     key="owner",
 )
-code = A["code_by_label"].get(owner_label) if owner_label else None
+code, client = A["label_to_owner"].get(owner_label, (None, None)) if owner_label else (None, None)
 
 # ---- 2) SignIn Date ----
 signin = st.date_input("2 · SignIn Date *", value=date.today(), format="YYYY-MM-DD", key="signin")
@@ -524,7 +531,7 @@ if save_clicked:
         if forms_v is not None and forms_v > 0 and supports_v is not None and supports_v > 0:
             ads = round(supports_v / forms_v, ADS_DECIMALS)
             valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
-                               "BAName": effective_ba, "BACode": row_code,
+                               "BAName": effective_ba, "BACode": row_code, "Clients": client or "",
                                "Forms": forms, "Supports": supports, "ADS": ads})
 
     if not errors and not valid_rows:
