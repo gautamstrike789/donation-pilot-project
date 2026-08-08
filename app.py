@@ -4,9 +4,15 @@ Donation Entry — Owner submission portal (Streamlit + Google Sheets)
 Form order:  Owner Code  →  SignIn Date  →  BA Name  →  Add-new-BA  →  Donations (+ rows)
 
 Data source: two Google Sheets configured via sheets_config.json (created by setup.py):
-    • Admin sheet  — worksheets "Owners" (OWNCODE|OwnerName|City) and "BAs" (OWNCODE|BACode|BAName)
+    • Admin sheet  — worksheets "Owners" (OWNCODE|OwnerName|City), "BAs" (OWNCODE|BACode|BAName),
+      and "Events" (OWNCODE|OwnerName|EventName, added by setup_events.py)
     • Donations sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Amount(Amt), Age, SOD
+        SigninDT, OWNCODE, BAName, BACode, Amount(Amt), Age, SOD, Event Name, Airport Name
+
+When SOD is "Events", a second dropdown offers the Event Names mapped to the
+selected owner (from the Events worksheet). When SOD is "Airport", a second
+dropdown offers a fixed list of airport cities. Either selection is saved into
+its own column in the Donations sheet.
 
 Uses OAuth (your Google account) — no service account keys needed.
 No file-locking issues — you can keep both sheets open in your browser while submitting.
@@ -38,8 +44,9 @@ CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token.pickle"
 SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Amount(Amt)", "Age", "SOD"]
+HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Amount(Amt)", "Age", "SOD", "Event Name", "Airport Name"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport"]
+AIRPORT_OPTIONS = ["Vizag", "Coimbatore", "Trichy", "Goa", "Jaipur", "Indore", "Ahmedabad", "Chennai"]
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -122,6 +129,12 @@ def cloud_secrets_ready():
     return _has_secret(SERVICE_ACCOUNT_SECTION) and _has_secret(SECRETS_SECTION)
 
 
+def donations_sheet_url():
+    """The exact Google Sheet this app writes to — open this to verify your data."""
+    cfg = load_config()
+    return f"https://docs.google.com/spreadsheets/d/{cfg['donations_sheet_id']}"
+
+
 # --------------------------------------------------------------------------- #
 #  Read dropdown data from the Admin Google Sheet (cached 2 min)
 # --------------------------------------------------------------------------- #
@@ -168,8 +181,22 @@ def load_admin():
     for c in ba_by_code:
         ba_by_code[c] = sorted(ba_by_code[c], key=lambda t: t[0].lower())
 
+    events_rows = sheet_rows("Events")
+    events_by_code = {}
+    for r in events_rows:
+        c = str(r.get("OWNCODE", "")).strip()
+        name = str(r.get("EventName", "")).strip()
+        if not c or not name:
+            continue
+        events_by_code.setdefault(c, [])
+        if name not in events_by_code[c]:
+            events_by_code[c].append(name)
+    for c in events_by_code:
+        events_by_code[c] = sorted(events_by_code[c], key=str.lower)
+
     return {"label_by_code": label_by_code, "code_by_label": code_by_label,
-            "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes}
+            "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes,
+            "events_by_code": events_by_code}
 
 
 def _get_status_code(e):
@@ -236,10 +263,15 @@ def append_bas(new_rows):
 
 
 def append_donations(rows):
-    """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet."""
+    """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet.
+    Returns (rows_before, rows_after) read straight back from the sheet so the
+    caller can prove the write actually landed (data row count excludes header)."""
     cfg = load_config()
     ws = get_ws(cfg["donations_sheet_id"], "_ws_donations", 0)
+    before = max(len(ws.get_all_values()) - 1, 0)
     _append_with_retry(ws, [[r[h] for h in HEADERS] for r in rows], cache_keys=("_ws_donations",))
+    after = max(len(ws.get_all_values()) - 1, 0)
+    return before, after
 
 
 def session_xlsx_bytes(entries):
@@ -327,6 +359,9 @@ st.session_state.setdefault("session_entries", [])
 st.session_state.setdefault("new_bas", {})
 st.session_state.setdefault("pending_preview", [])    # validated rows awaiting confirm (accumulates across BAs)
 st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the Admin sheet, written on Submit
+st.session_state.setdefault("flash_success", None)    # confirmation message that survives the post-submit rerun
+st.session_state.setdefault("preview_nonce", 0)       # rotated whenever pending_preview resets, so the
+                                                       # preview editor widget doesn't carry over stale edits
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
 
@@ -343,6 +378,67 @@ def parse_age_value(raw_age):
         return None
     return int(age_value)
 
+
+def fmt_number(v):
+    """Render a numeric cell (possibly numpy float64 from the data editor) back to
+    a plain string, without a spurious trailing .0 for whole numbers."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v) if v is not None else ""
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+def validate_edited_rows(records):
+    """Re-validate rows coming back from the editable preview grid (values may
+    have been typed/changed there). Returns (errors, clean_rows) — clean_rows
+    is only meaningful when errors is empty."""
+    errors, clean_rows = [], []
+    for i, r in enumerate(records, start=1):
+        signindt = str(r.get("SigninDT") or "").strip()
+        ownc = str(r.get("OWNCODE") or "").strip()
+        ban = str(r.get("BAName") or "").strip()
+        bac = str(r.get("BACode") or "").strip()
+        sod_v = str(r.get("SOD") or "").strip()
+        event_v = str(r.get("Event Name") or "").strip()
+        airport_v = str(r.get("Airport Name") or "").strip()
+        amt_raw, age_raw = r.get("Amount(Amt)"), r.get("Age")
+
+        # a blank row added via the grid's "+" control — skip silently
+        if not any([signindt, ownc, ban, sod_v, amt_raw not in (None, ""), age_raw not in (None, "")]):
+            continue
+
+        try:
+            amt_v = float(amt_raw)
+        except (TypeError, ValueError):
+            amt_v = None
+        age_v = parse_age_value(age_raw)
+
+        if not signindt:
+            errors.append(f"Row {i}: **SigninDT** is required.")
+        if not ownc:
+            errors.append(f"Row {i}: **OWNCODE** is required.")
+        if not ban:
+            errors.append(f"Row {i}: **BAName** is required.")
+        if amt_v is None or amt_v < 499:
+            errors.append(f"Row {i}: **Amount(Amt)** must be 499 or more.")
+        if age_v is None or not (24 < age_v < 100):
+            errors.append(f"Row {i}: **Age** must be a whole number between 25 and 99.")
+        if not sod_v or sod_v not in SOD_CATEGORIES:
+            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_CATEGORIES)}.")
+        elif sod_v == "Events" and not event_v:
+            errors.append(f"Row {i}: **Event Name** is required when SOD is Events.")
+        elif sod_v == "Airport" and not airport_v:
+            errors.append(f"Row {i}: **Airport Name** is required when SOD is Airport.")
+
+        clean_rows.append({
+            "SigninDT": signindt, "OWNCODE": ownc, "BAName": ban, "BACode": bac,
+            "Amount(Amt)": fmt_number(amt_raw), "Age": fmt_number(age_raw), "SOD": sod_v,
+            "Event Name": event_v if sod_v == "Events" else "",
+            "Airport Name": airport_v if sod_v == "Airport" else "",
+        })
+    return errors, clean_rows
+
 # --------------------------------------------------------------------------- #
 #  Header
 # --------------------------------------------------------------------------- #
@@ -352,6 +448,17 @@ if os.path.exists(LOGO_FILE):
     hc1.image(LOGO_FILE, width=130)
 hc2.title("Donation Entry")
 hc2.caption(f"{len(A['label_by_code'])} owners · {total_bas:,} BAs · source: Google Sheets")
+
+# Persistent confirmation that survives the post-submit rerun, plus the exact
+# sheet this app writes to — open it to confirm you're looking at the right file.
+if st.session_state.get("flash_success"):
+    st.success(st.session_state.pop("flash_success"))
+with st.expander("📄 Where does Submit save? (click to verify)"):
+    st.markdown(f"All submissions are written to this sheet → [{donations_sheet_url()}]({donations_sheet_url()})")
+    st.caption(
+        "If your entries don't appear, make sure THIS is the sheet you have open. "
+        "Running `setup.py` more than once creates extra sheets with the same name."
+    )
 
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
@@ -442,7 +549,24 @@ for idx, rid in enumerate(st.session_state.rows, start=1):
                 d2.caption(":red[⚠ Enter a whole number]")
         sod = st.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
                            placeholder="Select a source…", key=f"sod_{rid}")
-        row_inputs.append((idx, amt, age, sod))
+
+        event_name, airport_name = "", ""
+        if sod == "Events":
+            owner_events = A["events_by_code"].get(code, []) if code else []
+            if not code:
+                st.selectbox("Event Name *", [], index=None, disabled=True,
+                             placeholder="Select owner code first…", key=f"event_ph_{rid}")
+            elif not owner_events:
+                st.selectbox("Event Name *", [], index=None, disabled=True,
+                             placeholder="No events mapped for this owner", key=f"event_ph_{rid}")
+            else:
+                event_name = st.selectbox("Event Name *", owner_events, index=None,
+                                          placeholder="Select an event…", key=f"event_{rid}")
+        elif sod == "Airport":
+            airport_name = st.selectbox("Airport Name *", AIRPORT_OPTIONS, index=None,
+                                        placeholder="Select an airport…", key=f"airport_{rid}")
+
+        row_inputs.append((idx, amt, age, sod, event_name, airport_name))
 
 if to_remove is not None:
     st.session_state.rows.remove(to_remove)
@@ -492,7 +616,7 @@ if save_clicked:
 
     # validate every donation row
     valid_rows = []
-    for idx, amt, age, sod in row_inputs:
+    for idx, amt, age, sod, event_name, airport_name in row_inputs:
         amt = (amt or "").strip()
         age = (age or "").strip()
         try:
@@ -509,10 +633,16 @@ if save_clicked:
             errors.append(f"Donation #{idx}: age must be **between 25 and 99**.")
         if not sod:
             errors.append(f"Donation #{idx}: select a **source of donation**.")
-        if amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod:
+        elif sod == "Events" and not event_name:
+            errors.append(f"Donation #{idx}: select an **event name**.")
+        elif sod == "Airport" and not airport_name:
+            errors.append(f"Donation #{idx}: select an **airport**.")
+        if (amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod
+                and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)):
             valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
                                "BAName": effective_ba, "BACode": row_code,
-                               "Amount(Amt)": amt, "Age": age, "SOD": sod})
+                               "Amount(Amt)": amt, "Age": age, "SOD": sod,
+                               "Event Name": event_name, "Airport Name": airport_name})
 
     if not errors and not valid_rows:
         errors.append("Add at least one donation (amount, age, source) before saving.")
@@ -542,15 +672,33 @@ if save_clicked:
 if st.session_state.pending_preview:
     preview = st.session_state.pending_preview
     staged_new = st.session_state.pending_new_bas
-    ba_count = len({(r["OWNCODE"], r["BAName"]) for r in preview})
 
     st.divider()
     st.subheader("📋 Preview — review before submitting")
+    st.caption("Click any cell to fix a wrong entry, or remove a row with the 🗑 icon on the right.")
+
+    preview_df = pd.DataFrame(preview)[HEADERS].copy()
+    preview_df["Amount(Amt)"] = pd.to_numeric(preview_df["Amount(Amt)"], errors="coerce")
+    preview_df["Age"] = pd.to_numeric(preview_df["Age"], errors="coerce")
+    edited_df = st.data_editor(
+        preview_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key=f"preview_editor_{st.session_state.preview_nonce}",
+        column_config={
+            "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
+            "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
+            "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
+            "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=AIRPORT_OPTIONS),
+        },
+    )
+    edited_records = edited_df.to_dict("records")
+    ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
     st.info(
-        f"**{len(preview)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
+        f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
         "Add more BAs with **Save all entries**, or click **Submit** to write them all."
     )
-    st.dataframe(pd.DataFrame(preview)[HEADERS], use_container_width=True, hide_index=True)
 
     pc1, pc2 = st.columns(2)
     submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
@@ -559,42 +707,72 @@ if st.session_state.pending_preview:
     if cancel_clicked:
         st.session_state.pending_preview = []
         st.session_state.pending_new_bas = []
+        st.session_state.preview_nonce += 1
         st.rerun()
 
     if submit_clicked:
-        ok_to_save = True
+        edit_errors, final_rows = validate_edited_rows(edited_records)
+        if not edit_errors and not final_rows:
+            edit_errors = ["Add at least one donation before submitting."]
 
-        # 1) register any staged new BAs in the Admin sheet first
-        if staged_new:
-            try:
-                for owner_code, cd, effective_ba in staged_new:
-                    if cd and cd != "Unassigned" and cd in A["ba_codes"]:
-                        st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
-                append_bas([(o, cd, nm) for o, cd, nm in staged_new])
-                load_admin.clear()
-                for owner_code, cd, effective_ba in staged_new:
-                    st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
-                added = ", ".join(f"{nm} ({cd})" for _o, cd, nm in staged_new)
-                st.success(f"➕ New BA(s) added to Admin sheet: {added}")
-            except Exception as e:  # noqa: BLE001
-                ok_to_save = False
-                st.error(f"Couldn't update Admin sheet: {e}")
+        if edit_errors:
+            for e in edit_errors:
+                st.error(e)
+        else:
+            ok_to_save = True
 
-        # 2) write all donations
-        if ok_to_save:
-            try:
-                append_donations(preview)
-                st.session_state.session_entries.extend(preview)
-                st.success(f"✅ Submitted **{len(preview)}** donation(s) across **{ba_count}** BA(s) → Donations sheet")
-                st.session_state.pending_preview = []
-                st.session_state.pending_new_bas = []
-                st.session_state.nonce += 1
-                st.session_state.ba_nonce += 1
-                st.session_state.rows = [st.session_state.next_id]
-                st.session_state.next_id += 1
-                st.rerun()
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Couldn't save to Donations sheet: {e}")
+            # 1) register any staged new BAs in the Admin sheet first
+            if staged_new:
+                try:
+                    for owner_code, cd, effective_ba in staged_new:
+                        if cd and cd != "Unassigned" and cd in A["ba_codes"]:
+                            st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
+                    append_bas([(o, cd, nm) for o, cd, nm in staged_new])
+                    load_admin.clear()
+                    for owner_code, cd, effective_ba in staged_new:
+                        st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
+                    added = ", ".join(f"{nm} ({cd})" for _o, cd, nm in staged_new)
+                    st.success(f"➕ New BA(s) added to Admin sheet: {added}")
+                except Exception as e:  # noqa: BLE001
+                    ok_to_save = False
+                    st.error(f"Couldn't update Admin sheet: {e}")
+
+            # 2) write all donations
+            if ok_to_save:
+                try:
+                    before, after = append_donations(final_rows)
+                    added = after - before
+                    st.session_state.session_entries.extend(final_rows)
+                    if added < len(final_rows):
+                        # The API returned success but fewer rows than expected landed.
+                        st.warning(
+                            f"Expected to add {len(final_rows)} row(s) but the sheet grew by {added}. "
+                            f"Check the Donations sheet directly: {donations_sheet_url()}"
+                        )
+                    final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
+                    st.session_state.flash_success = (
+                        f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s). "
+                        f"The Donations sheet now holds {after} data row(s). "
+                        f"Open it to verify → {donations_sheet_url()}"
+                    )
+                    st.session_state.pending_preview = []
+                    st.session_state.pending_new_bas = []
+                    st.session_state.nonce += 1
+                    st.session_state.ba_nonce += 1
+                    st.session_state.preview_nonce += 1
+                    st.session_state.rows = [st.session_state.next_id]
+                    st.session_state.next_id += 1
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Couldn't save to Donations sheet: {e}")
+                    if "403" in str(e) or "PERMISSION_DENIED" in str(e):
+                        st.caption(
+                            "**403 / permission denied** — the account the app signs in as cannot "
+                            "edit that sheet. Open the Donations sheet, click **Share**, and give "
+                            "**Editor** access to the right account (your Google login locally, or the "
+                            "service-account email on Streamlit Cloud)."
+                        )
+                    st.caption(f"Target sheet: {donations_sheet_url()}")
 
 # --------------------------------------------------------------------------- #
 #  Submitted entries (this session) + downloads
