@@ -8,16 +8,20 @@ Streamlit app for owner/BA donation entry backed by Google Sheets.
 python -m pip install -r requirements.txt
 python setup.py
 python setup_events.py     # one-time: adds the Events worksheet (Event dropdown source)
+python setup_airports.py   # one-time: adds the Airports worksheet (Airport dropdown source)
 python -m streamlit run app.py
 ```
 
 When SOD is "Events" the form offers a second dropdown of Event Names mapped to
 the selected owner (from the Admin sheet's "Events" worksheet, uploaded by
 `setup_events.py` from `EventDataForForm.xlsx`). When SOD is "Airport" it offers
-a fixed list of airport cities. Either selection is saved into its own column
-(`Event Name`, `Airport Name`) in the Donations sheet, right after `SOD`. The
-preview step before Submit is an editable grid — fix a wrong entry or delete a
-row before writing to the sheet.
+the list from the Admin sheet's "Airports" worksheet — edit that sheet directly
+(add/remove/rename a row) to change the dropdown, no code change needed. Either
+selection is saved into its own column (`Event Name`, `Airport Name`) in the
+Donations sheet, right after `SOD`. `OwnerName` is also saved next to `OWNCODE`,
+looked up automatically from the Owners worksheet. The preview step before
+Submit is an editable grid — fix a wrong entry or delete a row before writing
+to the sheet.
 
 ## One-Off form
 

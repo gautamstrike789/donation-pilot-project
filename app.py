@@ -5,14 +5,16 @@ Form order:  Owner Code  →  SignIn Date  →  BA Name  →  Add-new-BA  →  D
 
 Data source: two Google Sheets configured via sheets_config.json (created by setup.py):
     • Admin sheet  — worksheets "Owners" (OWNCODE|OwnerName|City), "BAs" (OWNCODE|BACode|BAName),
-      and "Events" (OWNCODE|OwnerName|EventName, added by setup_events.py)
+      "Events" (OWNCODE|OwnerName|EventName, added by setup_events.py), and "Airports"
+      (AirportName, added by setup_airports.py)
     • Donations sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Amount(Amt), Age, SOD, Event Name, Airport Name
+        SigninDT, OWNCODE, OwnerName, BAName, BACode, Amount(Amt), Age, SOD, Event Name, Airport Name
 
 When SOD is "Events", a second dropdown offers the Event Names mapped to the
 selected owner (from the Events worksheet). When SOD is "Airport", a second
-dropdown offers a fixed list of airport cities. Either selection is saved into
-its own column in the Donations sheet.
+dropdown offers the airport list from the Airports worksheet — edit that sheet
+directly to add/remove/rename an airport. Either selection is saved into its
+own column in the Donations sheet.
 
 Uses OAuth (your Google account) — no service account keys needed.
 No file-locking issues — you can keep both sheets open in your browser while submitting.
@@ -44,9 +46,8 @@ CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token.pickle"
 SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Amount(Amt)", "Age", "SOD", "Event Name", "Airport Name"]
+HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Amount(Amt)", "Age", "SOD", "Event Name", "Airport Name"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport"]
-AIRPORT_OPTIONS = ["Vizag", "Coimbatore", "Trichy", "Goa", "Jaipur", "Indore", "Ahmedabad", "Chennai"]
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -129,12 +130,6 @@ def cloud_secrets_ready():
     return _has_secret(SERVICE_ACCOUNT_SECTION) and _has_secret(SECRETS_SECTION)
 
 
-def donations_sheet_url():
-    """The exact Google Sheet this app writes to — open this to verify your data."""
-    cfg = load_config()
-    return f"https://docs.google.com/spreadsheets/d/{cfg['donations_sheet_id']}"
-
-
 # --------------------------------------------------------------------------- #
 #  Read dropdown data from the Admin Google Sheet (cached 2 min)
 # --------------------------------------------------------------------------- #
@@ -194,9 +189,16 @@ def load_admin():
     for c in events_by_code:
         events_by_code[c] = sorted(events_by_code[c], key=str.lower)
 
+    airports_rows = sheet_rows("Airports")
+    airport_options = []
+    for r in airports_rows:
+        name = str(r.get("AirportName", "")).strip()
+        if name and name not in airport_options:
+            airport_options.append(name)
+
     return {"label_by_code": label_by_code, "code_by_label": code_by_label,
             "owner_meta": owner_meta, "ba_by_code": ba_by_code, "ba_codes": ba_codes,
-            "events_by_code": events_by_code}
+            "events_by_code": events_by_code, "airport_options": airport_options}
 
 
 def _get_status_code(e):
@@ -397,6 +399,7 @@ def validate_edited_rows(records):
     for i, r in enumerate(records, start=1):
         signindt = str(r.get("SigninDT") or "").strip()
         ownc = str(r.get("OWNCODE") or "").strip()
+        ownername = str(r.get("OwnerName") or "").strip()
         ban = str(r.get("BAName") or "").strip()
         bac = str(r.get("BACode") or "").strip()
         sod_v = str(r.get("SOD") or "").strip()
@@ -432,7 +435,7 @@ def validate_edited_rows(records):
             errors.append(f"Row {i}: **Airport Name** is required when SOD is Airport.")
 
         clean_rows.append({
-            "SigninDT": signindt, "OWNCODE": ownc, "BAName": ban, "BACode": bac,
+            "SigninDT": signindt, "OWNCODE": ownc, "OwnerName": ownername, "BAName": ban, "BACode": bac,
             "Amount(Amt)": fmt_number(amt_raw), "Age": fmt_number(age_raw), "SOD": sod_v,
             "Event Name": event_v if sod_v == "Events" else "",
             "Airport Name": airport_v if sod_v == "Airport" else "",
@@ -448,17 +451,6 @@ if os.path.exists(LOGO_FILE):
     hc1.image(LOGO_FILE, width=130)
 hc2.title("Donation Entry")
 hc2.caption(f"{len(A['label_by_code'])} owners · {total_bas:,} BAs · source: Google Sheets")
-
-# Persistent confirmation that survives the post-submit rerun, plus the exact
-# sheet this app writes to — open it to confirm you're looking at the right file.
-if st.session_state.get("flash_success"):
-    st.success(st.session_state.pop("flash_success"))
-with st.expander("📄 Where does Submit save? (click to verify)"):
-    st.markdown(f"All submissions are written to this sheet → [{donations_sheet_url()}]({donations_sheet_url()})")
-    st.caption(
-        "If your entries don't appear, make sure THIS is the sheet you have open. "
-        "Running `setup.py` more than once creates extra sheets with the same name."
-    )
 
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
@@ -563,7 +555,7 @@ for idx, rid in enumerate(st.session_state.rows, start=1):
                 event_name = st.selectbox("Event Name *", owner_events, index=None,
                                           placeholder="Select an event…", key=f"event_{rid}")
         elif sod == "Airport":
-            airport_name = st.selectbox("Airport Name *", AIRPORT_OPTIONS, index=None,
+            airport_name = st.selectbox("Airport Name *", A["airport_options"], index=None,
                                         placeholder="Select an airport…", key=f"airport_{rid}")
 
         row_inputs.append((idx, amt, age, sod, event_name, airport_name))
@@ -639,8 +631,9 @@ if save_clicked:
             errors.append(f"Donation #{idx}: select an **airport**.")
         if (amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod
                 and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)):
+            owner_name = A["owner_meta"].get(code, ("", ""))[0]
             valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
-                               "BAName": effective_ba, "BACode": row_code,
+                               "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
                                "Amount(Amt)": amt, "Age": age, "SOD": sod,
                                "Event Name": event_name, "Airport Name": airport_name})
 
@@ -690,7 +683,7 @@ if st.session_state.pending_preview:
             "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
             "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
             "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
-            "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=AIRPORT_OPTIONS),
+            "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=A["airport_options"]),
         },
     )
     edited_records = edited_df.to_dict("records")
@@ -746,15 +739,14 @@ if st.session_state.pending_preview:
                     if added < len(final_rows):
                         # The API returned success but fewer rows than expected landed.
                         st.warning(
-                            f"Expected to add {len(final_rows)} row(s) but the sheet grew by {added}. "
-                            f"Check the Donations sheet directly: {donations_sheet_url()}"
+                            f"Expected to add {len(final_rows)} row(s) but only {added} landed. "
+                            "Please contact the admin to verify your data was saved correctly."
                         )
-                    final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
-                    st.session_state.flash_success = (
-                        f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s). "
-                        f"The Donations sheet now holds {after} data row(s). "
-                        f"Open it to verify → {donations_sheet_url()}"
-                    )
+                    else:
+                        final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
+                        st.session_state.flash_success = (
+                            f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s)."
+                        )
                     st.session_state.pending_preview = []
                     st.session_state.pending_new_bas = []
                     st.session_state.nonce += 1
@@ -772,7 +764,6 @@ if st.session_state.pending_preview:
                             "**Editor** access to the right account (your Google login locally, or the "
                             "service-account email on Streamlit Cloud)."
                         )
-                    st.caption(f"Target sheet: {donations_sheet_url()}")
 
 # --------------------------------------------------------------------------- #
 #  Submitted entries (this session) + downloads
@@ -791,3 +782,7 @@ if se:
     )
 else:
     st.info("Entries you save in this session will appear here, updating live as you submit.")
+
+# Confirmation shown last, at the very bottom, right after the submitted-entries list.
+if st.session_state.get("flash_success"):
+    st.success(st.session_state.pop("flash_success"))
