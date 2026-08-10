@@ -47,7 +47,7 @@ TOKEN_FILE = "token.pickle"
 SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Amount(Amt)", "Age", "SOD", "Event Name", "Airport Name"]
-SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport"]
+SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport", "Roadtrip"]
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -673,6 +673,7 @@ if st.session_state.pending_preview:
     preview_df = pd.DataFrame(preview)[HEADERS].copy()
     preview_df["Amount(Amt)"] = pd.to_numeric(preview_df["Amount(Amt)"], errors="coerce")
     preview_df["Age"] = pd.to_numeric(preview_df["Age"], errors="coerce")
+    preview_df.insert(0, "S.No", range(1, len(preview_df) + 1))
     edited_df = st.data_editor(
         preview_df,
         use_container_width=True,
@@ -680,6 +681,7 @@ if st.session_state.pending_preview:
         num_rows="dynamic",
         key=f"preview_editor_{st.session_state.preview_nonce}",
         column_config={
+            "S.No": st.column_config.NumberColumn("S.No", disabled=True),
             "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
             "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
             "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
