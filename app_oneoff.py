@@ -1,25 +1,47 @@
 """
 Donation Entry — One-Off Owner submission portal (Streamlit + Google Sheets)
 =============================================================================
-Form order:  Owner Code  →  SignIn Date  →  BA Name  →  Add-new-BA  →  Entries (+ rows)
+Form order:  Owner Code  →  Passcode  →  SignIn Date  →  BA Name  →  Add-new-BA  →  Entries (+ rows)
 
 Data source: its own dedicated sheets, independent from the main donation form,
 configured via sheets_config.json (created by setup_oneoff.py):
-    • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|Client) and "BAs" (OWNCODE|BACode|BAName).
-      An OWNCODE can have multiple Owners rows with a different Client (e.g. HAI,
-      STC) — each is its own selectable entry; picking one sets both together.
+    • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|Client|Passcode,
+      Passcode added by setup_oneoff_owner_passcodes.py) and "BAs"
+      (OWNCODE|BACode|BAName|New Joinee Date, New Joinee Date added by
+      setup_oneoff_ba_joinee_date.py). An OWNCODE can have multiple Owners rows
+      with a different Client (e.g. HAI, STC) — each is its own selectable
+      entry; picking one sets both together. A Passcode protects the OWNCODE
+      as a whole, regardless of which Client row was picked.
     • Donations One-Off sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS
+        SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS, No Forms
+      (No Forms added by setup_oneoff_no_forms_column.py)
 
 ADS (Average Donation per Support) is calculated automatically as
 Supports / Forms — it is not a form input.
+
+The first time an owner with a blank "Passcode" cell (Owners sheet) is
+picked, the form asks them to set one (typed twice to confirm) and saves it
+to every row sharing that OWNCODE. From then on, picking that owner shows a
+passcode box that gates everything below it (SignIn Date onward, plus the
+Owners Data History view) until the correct passcode is entered — for the
+rest of that browser session, it isn't asked again.
+
+The "No Forms" checkbox (right after SignIn Date) is for an owner with
+nothing to report for that sign-in — it hides BA/Entries and records a
+single row with only SigninDT, OWNCODE, and Clients filled in, no preview
+step. When a brand-new BA is added through the form, the SignIn Date used
+for that submission is written into the BAs sheet's "New Joinee Date"
+column — never shown in the form itself.
 
 Uses OAuth (your Google account) — no service account keys needed.
 
 Run:
     python -m pip install -r requirements.txt
-    python setup.py            # one-time: signs in with your Google account
-    python setup_oneoff.py     # one-time: creates the Admin + Donations One-Off sheets + extends config
+    python setup.py                        # one-time: signs in with your Google account
+    python setup_oneoff.py                 # one-time: creates the Admin + Donations One-Off sheets + extends config
+    python setup_oneoff_owner_passcodes.py # one-time: adds the Passcode column to Owners
+    python setup_oneoff_ba_joinee_date.py  # one-time: adds the New Joinee Date column to BAs
+    python setup_oneoff_no_forms_column.py # one-time: adds the No Forms column to Donations One-Off
     python -m streamlit run app_oneoff.py
 """
 
@@ -27,7 +49,6 @@ import json
 import os
 import pickle
 import time
-from datetime import date
 from io import BytesIO
 
 import gspread
@@ -46,7 +67,7 @@ SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "Forms", "Supports", "ADS"]
+HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "Forms", "Supports", "ADS", "No Forms"]
 ADS_DECIMALS = 1
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -159,8 +180,11 @@ def load_admin():
 
     # Every (OWNCODE, Client) row is its own dropdown entry — the same owner
     # code can appear multiple times with a different Client (e.g. HAI, STC),
-    # and selecting one picks both the owner and the client together.
+    # and selecting one picks both the owner and the client together. The
+    # Passcode protects the OWNCODE as a whole, so we take the first
+    # non-blank Passcode found across all of that owner's rows.
     owner_labels, label_to_owner, owner_codes = [], {}, set()
+    owner_name_by_code, passcode_by_code = {}, {}
     for r in owners_rows:
         c = str(r.get("OWNCODE", "")).strip()
         if not c:
@@ -173,6 +197,12 @@ def load_admin():
             owner_labels.append(label)
             label_to_owner[label] = (c, client)
         owner_codes.add(c)
+        owner_name_by_code.setdefault(c, name)
+        pc = str(r.get("Passcode", "")).strip()
+        if pc and not passcode_by_code.get(c):
+            passcode_by_code[c] = pc
+        else:
+            passcode_by_code.setdefault(c, "")
 
     ba_by_code, ba_codes = {}, set()
     for r in bas_rows:
@@ -190,7 +220,20 @@ def load_admin():
         ba_by_code[c] = sorted(ba_by_code[c], key=lambda t: t[0].lower())
 
     return {"owner_labels": owner_labels, "label_to_owner": label_to_owner,
-            "owner_count": len(owner_codes), "ba_by_code": ba_by_code, "ba_codes": ba_codes}
+            "owner_count": len(owner_codes), "owner_name_by_code": owner_name_by_code,
+            "passcode_by_code": passcode_by_code,
+            "ba_by_code": ba_by_code, "ba_codes": ba_codes}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_donations_df():
+    """Whole Donations One-Off sheet, cached briefly — backs the Owners Data History view."""
+    cfg = load_config()
+    ws = get_ws(cfg[DONATIONS_SHEET_KEY], "_ws_donations_oneoff", 0)
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return pd.DataFrame(columns=HEADERS)
+    return pd.DataFrame(values[1:], columns=values[0])
 
 
 def _get_status_code(e):
@@ -203,15 +246,38 @@ def _get_status_code(e):
     return None
 
 
+def _col_letter(n):
+    """1 -> A, 2 -> B, ... 27 -> AA, etc."""
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
 def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
     """Append rows with exponential backoff for 429 (rate limit) and
     automatic session reset for 401/403 (expired token).
-    cache_keys: tuple of session_state keys to clear on auth failure."""
+    cache_keys: tuple of session_state keys to clear on auth failure.
+
+    Writes to an explicitly-computed row range instead of using
+    ws.append_rows(): the main RG form's Donations/BAs sheets had a Google
+    Sheets filter that made append_rows's automatic "find the table" logic
+    misdetect the table extent — landing new rows at row 2, or even
+    overwriting an existing row, instead of appending at the true bottom.
+    An explicit range sidesteps that detection risk entirely, here too."""
     notice = st.empty()
     try:
         for attempt in range(max_attempts):
             try:
-                ws.append_rows(rows, value_input_option="RAW")
+                start_row = len(ws.get_all_values()) + 1
+                end_row = start_row + len(rows) - 1
+                end_col = _col_letter(len(rows[0]))
+                ws.update(
+                    range_name=f"A{start_row}:{end_col}{end_row}",
+                    values=rows,
+                    value_input_option="RAW",
+                )
                 return
             except gspread.exceptions.APIError as e:
                 code = _get_status_code(e)
@@ -243,6 +309,47 @@ def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
                             sh = st.session_state.gc.open_by_key(cfg[ADMIN_SHEET_KEY])
                             st.session_state[ck] = sh.worksheet("BAs")
                             ws = st.session_state[ck]
+                        elif ck == "_ws_owners":
+                            sh = st.session_state.gc.open_by_key(cfg[ADMIN_SHEET_KEY])
+                            st.session_state[ck] = sh.worksheet("Owners")
+                            ws = st.session_state[ck]
+                else:
+                    raise
+    finally:
+        notice.empty()
+
+
+def _update_cell_with_retry(ws, row, col, value, cache_keys, max_attempts=8):
+    """Same retry/backoff/re-auth handling as _append_with_retry, for a
+    single-cell write to an existing row (no table-detection risk here —
+    the target cell is addressed directly)."""
+    notice = st.empty()
+    try:
+        for attempt in range(max_attempts):
+            try:
+                ws.update_cell(row, col, value)
+                return
+            except gspread.exceptions.APIError as e:
+                code = _get_status_code(e)
+                if code == 429 and attempt < max_attempts - 1:
+                    wait = 2 ** attempt
+                    notice.warning(
+                        f"High traffic detected — retrying in {wait} second{'s' if wait > 1 else ''}. "
+                        f"Please do not close this tab."
+                    )
+                    time.sleep(wait)
+                elif code in (401, 403) and attempt == 0:
+                    notice.warning("Re-authenticating with Google — please wait a moment...")
+                    for k in ("gc", *cache_keys):
+                        st.session_state.pop(k, None)
+                    creds = get_credentials()
+                    st.session_state.gc = gspread.authorize(creds)
+                    cfg = load_config()
+                    for ck in cache_keys:
+                        if ck == "_ws_owners":
+                            sh = st.session_state.gc.open_by_key(cfg[ADMIN_SHEET_KEY])
+                            st.session_state[ck] = sh.worksheet("Owners")
+                            ws = st.session_state[ck]
                 else:
                     raise
     finally:
@@ -250,10 +357,29 @@ def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
 
 
 def append_bas(new_rows):
-    """new_rows: list of (OWNCODE, BACode, BAName) -> appended to the BAs worksheet."""
+    """new_rows: list of (OWNCODE, BACode, BAName, NewJoineeDate) -> appended to the BAs worksheet."""
     cfg = load_config()
     ws = get_ws(cfg[ADMIN_SHEET_KEY], "_ws_bas", "BAs")
     _append_with_retry(ws, [list(r) for r in new_rows], cache_keys=("_ws_bas",))
+
+
+def set_owner_passcode(code, passcode):
+    """Writes `passcode` into the Owners sheet's Passcode column for every
+    row whose OWNCODE is `code` (an owner can have several rows, one per
+    Client) — the passcode protects the owner as a whole."""
+    cfg = load_config()
+    ws = get_ws(cfg[ADMIN_SHEET_KEY], "_ws_owners", "Owners")
+    values = ws.get_all_values()
+    header = values[0]
+    code_idx = header.index("OWNCODE")
+    pc_idx = header.index("Passcode")
+    matched = False
+    for i, row in enumerate(values[1:], start=2):
+        if len(row) > code_idx and row[code_idx].strip() == code:
+            _update_cell_with_retry(ws, i, pc_idx + 1, passcode, cache_keys=("_ws_owners",))
+            matched = True
+    if not matched:
+        raise ValueError(f"Owner code {code!r} not found in the Owners sheet.")
 
 
 def append_donations(rows):
@@ -275,6 +401,18 @@ def session_xlsx_bytes(entries):
     ws.append(HEADERS)
     for e in entries:
         ws.append([e[h] for h in HEADERS])
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def df_to_xlsx_bytes(df, sheet_title="Sheet1"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    ws.append(list(df.columns))
+    for row in df.itertuples(index=False):
+        ws.append(list(row))
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
@@ -354,6 +492,8 @@ st.session_state.setdefault("new_bas", {})
 st.session_state.setdefault("pending_preview", [])    # validated rows awaiting confirm (accumulates across BAs)
 st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the Admin sheet, written on Submit
 st.session_state.setdefault("flash_success", None)    # confirmation message that survives the post-submit rerun
+st.session_state.setdefault("preview_nonce", 0)       # rotated whenever pending_preview resets, so the
+                                                       # preview editor widget doesn't carry over stale edits
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
 
@@ -369,6 +509,57 @@ def parse_positive_int(raw):
     if not value.is_integer():
         return None
     return int(value)
+
+
+def fmt_number(v):
+    """Render a numeric cell (possibly numpy float64 from the data editor) back to
+    a plain string, without a spurious trailing .0 for whole numbers."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v) if v is not None else ""
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+def validate_edited_rows(records):
+    """Re-validate rows coming back from the editable preview grid (values may
+    have been typed/changed there). Returns (errors, clean_rows) — clean_rows
+    is only meaningful when errors is empty. ADS is always recomputed from
+    Forms/Supports rather than trusted from the grid, since it's derived."""
+    errors, clean_rows = [], []
+    for i, r in enumerate(records, start=1):
+        signindt = str(r.get("SigninDT") or "").strip()
+        ownc = str(r.get("OWNCODE") or "").strip()
+        ban = str(r.get("BAName") or "").strip()
+        bac = str(r.get("BACode") or "").strip()
+        clients = str(r.get("Clients") or "").strip()
+        forms_raw, supports_raw = r.get("Forms"), r.get("Supports")
+
+        # a blank row added via the grid's "+" control — skip silently
+        if not any([signindt, ownc, ban, forms_raw not in (None, ""), supports_raw not in (None, "")]):
+            continue
+
+        forms_v = parse_positive_int(forms_raw)
+        supports_v = parse_positive_int(supports_raw)
+
+        if not signindt:
+            errors.append(f"Row {i}: **SigninDT** is required.")
+        if not ownc:
+            errors.append(f"Row {i}: **OWNCODE** is required.")
+        if not ban:
+            errors.append(f"Row {i}: **BAName** is required.")
+        if forms_v is None or forms_v <= 0:
+            errors.append(f"Row {i}: **Forms** must be a whole number greater than 0.")
+        if supports_v is None or supports_v <= 0:
+            errors.append(f"Row {i}: **Supports** must be a whole number greater than 0.")
+
+        ads = str(round(supports_v / forms_v, ADS_DECIMALS)) if forms_v and supports_v else ""
+        clean_rows.append({
+            "SigninDT": signindt, "OWNCODE": ownc, "BAName": ban, "BACode": bac,
+            "Clients": clients, "Forms": fmt_number(forms_raw), "Supports": fmt_number(supports_raw),
+            "ADS": ads, "No Forms": "0",
+        })
+    return errors, clean_rows
 
 
 # --------------------------------------------------------------------------- #
@@ -391,247 +582,437 @@ owner_label = st.selectbox(
 )
 code, client = A["label_to_owner"].get(owner_label, (None, None)) if owner_label else (None, None)
 
-# ---- 2) SignIn Date ----
-signin = st.date_input("2 · SignIn Date *", value=date.today(), format="YYYY-MM-DD", key="signin")
+st.session_state.setdefault("verified_owners", set())
 
-# ---- 3) BA Name (shows "Name · BACode"; key includes code so it resets when owner changes) ----
-combined = {}
-for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
-    combined[nm_] = cd_
-for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
-    combined.setdefault(nm_, cd_)
+passcode_ok = False
 if code:
-    for owner_c, cd_, nm_ in st.session_state.pending_new_bas:
-        if owner_c == code:
-            combined.setdefault(nm_, cd_)
-ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
-ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
-label_to_name = {(f"{nm_}  ·  {cd_}" if cd_ else nm_): nm_ for nm_, cd_ in ba_pairs}
-name_to_code = {nm_: cd_ for nm_, cd_ in ba_pairs}
-
-new_name_typed = bool(str(st.session_state.get(f"newname_{n}", "") or "").strip())
-if not code:
-    ba_ph = "Select owner code first…"
-elif new_name_typed:
-    ba_ph = "Disabled — you're adding a new BA below"
-else:
-    ba_ph = "Search BA name or code…"
-
-ba_sel_label = st.selectbox(
-    "3 · BA Name *",
-    ba_labels,
-    index=None,
-    placeholder=ba_ph,
-    disabled=(not code) or new_name_typed,
-    key=f"ba_{bn}_{code or 'x'}",
-)
-ba_sel = None if new_name_typed else (label_to_name.get(ba_sel_label) if ba_sel_label else None)
-
-# ---- 4) Add a new BA (optional) ----
-with st.container(border=True):
-    st.markdown("**➕ Add a new BA**  — fill these only if the BA isn't in the list above")
-    nb1, nb2 = st.columns(2)
-    new_ba_name = nb1.text_input("New BA Name", key=f"newname_{n}", disabled=not code,
-                                 placeholder="Full name")
-    code_mode = nb2.selectbox("New BA Code", ["Unassigned", "Enter code manually"],
-                              index=None, placeholder="Select…", disabled=not code,
-                              key=f"codemode_{n}")
-    manual_code = ""
-    if code_mode == "Enter code manually":
-        manual_code = st.text_input("Enter BA Code", key=f"manualcode_{n}", disabled=not code,
-                                    placeholder="e.g. MMUN011-09999")
-
-# ---- 5) Entries (dynamic rows) ----
-st.markdown("#### Entries")
-st.caption("Add one or more entries for this BA, then save them all at once.")
-
-row_inputs = []
-to_remove = None
-for idx, rid in enumerate(st.session_state.rows, start=1):
-    with st.container(border=True):
-        h = st.columns([6, 1])
-        h[0].markdown(f"**Entry #{idx}**")
-        if len(st.session_state.rows) > 1 and h[1].button("✕", key=f"rm_{rid}", help="Remove"):
-            to_remove = rid
-        d1, d2 = st.columns(2)
-        forms = d1.text_input("Forms *", key=f"forms_{rid}", placeholder="whole number > 0")
-        _f = (forms or "").strip()
-        forms_v = parse_positive_int(_f) if _f else None
-        if _f and (forms_v is None or forms_v <= 0):
-            d1.caption(":red[⚠ Enter a whole number greater than 0]")
-        supports = d2.text_input("Supports *", key=f"supports_{rid}", placeholder="whole number > 0")
-        _s = (supports or "").strip()
-        supports_v = parse_positive_int(_s) if _s else None
-        if _s and (supports_v is None or supports_v <= 0):
-            d2.caption(":red[⚠ Enter a whole number greater than 0]")
-        if forms_v and forms_v > 0 and supports_v is not None and supports_v > 0:
-            st.caption(f"ADS (Supports ÷ Forms) = **{round(supports_v / forms_v, ADS_DECIMALS)}**")
-        row_inputs.append((idx, forms, supports))
-
-if to_remove is not None:
-    st.session_state.rows.remove(to_remove)
-    st.rerun()
-
-ca, cs = st.columns(2)
-if ca.button("➕ Add another entry", use_container_width=True):
-    st.session_state.rows.append(st.session_state.next_id)
-    st.session_state.next_id += 1
-    st.rerun()
-save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True)
-
-# --------------------------------------------------------------------------- #
-#  Step 1: Validate + show preview (does NOT write to Google Sheets yet)
-# --------------------------------------------------------------------------- #
-if save_clicked:
-    errors = []
-    if not code:
-        errors.append("Select a valid **owner code**.")
-
-    # resolve BA: new vs existing
-    nm = (new_ba_name or "").strip()
-    if code_mode == "Unassigned":
-        cd = "Unassigned"
-    elif code_mode == "Enter code manually":
-        cd = (manual_code or "").strip()
+    stored_passcode = A["passcode_by_code"].get(code, "")
+    if code in st.session_state.verified_owners:
+        passcode_ok = True
+        st.caption("🔓 Passcode verified for this owner.")
+    elif not stored_passcode:
+        st.info(
+            "🔐 No passcode set for this owner yet — set one now. "
+            "You'll be asked for it every time you pick this owner from now on."
+        )
+        spc1, spc2 = st.columns(2)
+        new_passcode = spc1.text_input("Set a passcode", type="password", key=f"newpc_{code}")
+        confirm_passcode = spc2.text_input("Confirm passcode", type="password", key=f"newpc_confirm_{code}")
+        if st.button("💾 Save passcode", key=f"savepc_{code}"):
+            if not new_passcode or len(new_passcode) < 4:
+                st.error("Passcode must be at least 4 characters.")
+            elif new_passcode != confirm_passcode:
+                st.error("Passcodes don't match.")
+            else:
+                try:
+                    set_owner_passcode(code, new_passcode)
+                    load_admin.clear()
+                    st.session_state.verified_owners.add(code)
+                    st.session_state.flash_success = f"🔐 Passcode set for owner {code}."
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Couldn't save passcode: {e}")
     else:
-        cd = ""
-    existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
-    existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
-    existing_lower |= {nm_.lower() for owner_c, cd_, nm_ in st.session_state.pending_new_bas if owner_c == code}
-    is_new, effective_ba = False, ""
-    if nm:
-        effective_ba = nm
-        if nm.lower() not in existing_lower:
-            is_new = True
-            if not code_mode:
-                errors.append("Choose a **New BA Code** option — *Unassigned* or *Enter code manually*.")
-            elif code_mode == "Enter code manually" and not cd:
-                errors.append("Enter the **BA Code**, or choose *Unassigned*.")
-    elif ba_sel:
-        effective_ba = ba_sel
-    else:
-        errors.append("Select a **BA Name**, or add a new one.")
+        entered_passcode = st.text_input(
+            "🔒 Enter this owner's passcode to continue",
+            type="password",
+            key=f"passcode_{code}",
+        )
+        if entered_passcode:
+            if entered_passcode == stored_passcode:
+                st.session_state.verified_owners.add(code)
+                passcode_ok = True
+            else:
+                st.error("Incorrect passcode.")
 
-    row_code = cd if is_new else name_to_code.get(effective_ba, "")
+history_slot = st.empty()
 
-    # validate every entry row
-    valid_rows = []
-    for idx, forms, supports in row_inputs:
-        forms = (forms or "").strip()
-        supports = (supports or "").strip()
-        forms_v = parse_positive_int(forms)
-        supports_v = parse_positive_int(supports)
+if code and passcode_ok:
+    with st.container(key="entry_form"):
+        # ---- 2) SignIn Date ----
+        signin = st.date_input("2 · SignIn Date *", value=None, format="YYYY-MM-DD", key="signin")
 
-        if not any([forms, supports]):
-            continue
-        if forms_v is None or forms_v <= 0:
-            errors.append(f"Entry #{idx}: **Forms** must be a whole number greater than 0.")
-        if supports_v is None or supports_v <= 0:
-            errors.append(f"Entry #{idx}: **Supports** must be a whole number greater than 0.")
-        if forms_v is not None and forms_v > 0 and supports_v is not None and supports_v > 0:
-            ads = round(supports_v / forms_v, ADS_DECIMALS)
-            valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
-                               "BAName": effective_ba, "BACode": row_code, "Clients": client or "",
-                               "Forms": forms, "Supports": supports, "ADS": ads})
+        if not signin:
+            st.info("Select the **SignIn Date** above to continue.")
+        else:
+            # ---- No Forms ----
+            no_forms = st.checkbox(
+                "No Forms — this owner has no forms to report for this sign-in",
+                key=f"noforms_{n}",
+            )
 
-    if not errors and not valid_rows:
-        errors.append("Add at least one entry (Forms and Supports) before saving.")
+            if not no_forms:
+                # ---- 3) BA Name (shows "Name · BACode"; key includes code so it resets when owner changes) ----
+                combined = {}
+                for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
+                    combined[nm_] = cd_
+                for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
+                    combined.setdefault(nm_, cd_)
+                if code:
+                    for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas:
+                        if owner_c == code:
+                            combined.setdefault(nm_, cd_)
+                ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
+                ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
+                label_to_name = {(f"{nm_}  ·  {cd_}" if cd_ else nm_): nm_ for nm_, cd_ in ba_pairs}
+                name_to_code = {nm_: cd_ for nm_, cd_ in ba_pairs}
 
-    if errors:
-        for e in errors:
-            st.error(e)
-        # keep whatever is already staged in the preview; just don't add this invalid batch
-    else:
-        # accumulate validated rows into the running preview (NOT saved to Sheets yet)
-        st.session_state.pending_preview.extend(valid_rows)
-        # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
-        if is_new and effective_ba:
-            already = {(o, nm.lower()) for o, _c, nm in st.session_state.pending_new_bas}
-            if (code, effective_ba.lower()) not in already:
-                st.session_state.pending_new_bas.append((code, cd, effective_ba))
-        # clear for the next batch: keep owner code, sign-in date, and BA name;
-        # reset only the "add a new BA" fields and the entry rows
-        st.session_state.nonce += 1
-        st.session_state.rows = [st.session_state.next_id]
-        st.session_state.next_id += 1
-        st.rerun()
-
-# --------------------------------------------------------------------------- #
-#  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
-# --------------------------------------------------------------------------- #
-if st.session_state.pending_preview:
-    preview = st.session_state.pending_preview
-    staged_new = st.session_state.pending_new_bas
-    ba_count = len({(r["OWNCODE"], r["BAName"]) for r in preview})
-
-    st.divider()
-    st.subheader("📋 Preview — review before submitting")
-    st.info(
-        f"**{len(preview)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
-        "Add more BAs with **Save all entries**, or click **Submit** to write them all."
-    )
-    st.dataframe(pd.DataFrame(preview)[HEADERS], use_container_width=True, hide_index=True)
-
-    pc1, pc2 = st.columns(2)
-    submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
-    cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
-
-    if cancel_clicked:
-        st.session_state.pending_preview = []
-        st.session_state.pending_new_bas = []
-        st.rerun()
-
-    if submit_clicked:
-        ok_to_save = True
-
-        # 1) register any staged new BAs in the Admin sheet first
-        if staged_new:
-            try:
-                for owner_code, cd, effective_ba in staged_new:
-                    if cd and cd != "Unassigned" and cd in A["ba_codes"]:
-                        st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
-                append_bas([(o, cd, nm) for o, cd, nm in staged_new])
-                load_admin.clear()
-                for owner_code, cd, effective_ba in staged_new:
-                    st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
-                added = ", ".join(f"{nm} ({cd})" for _o, cd, nm in staged_new)
-                st.success(f"➕ New BA(s) added to Admin sheet: {added}")
-            except Exception as e:  # noqa: BLE001
-                ok_to_save = False
-                st.error(f"Couldn't update Admin sheet: {e}")
-
-        # 2) write all entries
-        if ok_to_save:
-            try:
-                before, after = append_donations(preview)
-                added = after - before
-                st.session_state.session_entries.extend(preview)
-                if added < len(preview):
-                    # The API returned success but fewer rows than expected landed.
-                    st.warning(
-                        f"Expected to add {len(preview)} row(s) but only {added} landed. "
-                        "Please contact the admin to verify your data was saved correctly."
-                    )
+                new_name_typed = bool(str(st.session_state.get(f"newname_{n}", "") or "").strip())
+                if not code:
+                    ba_ph = "Select owner code first…"
+                elif new_name_typed:
+                    ba_ph = "Disabled — you're adding a new BA below"
                 else:
-                    st.session_state.flash_success = (
-                        f"✅ Submitted {len(preview)} entry(s) across {ba_count} BA(s)."
+                    ba_ph = "Search BA name or code…"
+
+                ba_sel_label = st.selectbox(
+                    "3 · BA Name *",
+                    ba_labels,
+                    index=None,
+                    placeholder=ba_ph,
+                    disabled=(not code) or new_name_typed,
+                    key=f"ba_{bn}_{code or 'x'}",
+                )
+                ba_sel = None if new_name_typed else (label_to_name.get(ba_sel_label) if ba_sel_label else None)
+
+                # ---- 4) Add a new BA (optional) ----
+                with st.container(border=True):
+                    st.markdown("**➕ Add a new BA**  — fill these only if the BA isn't in the list above")
+                    nb1, nb2 = st.columns(2)
+                    new_ba_name = nb1.text_input("New BA Name", key=f"newname_{n}", disabled=not code,
+                                                 placeholder="Full name")
+                    code_mode = nb2.selectbox("New BA Code", ["Unassigned", "Enter code manually"],
+                                              index=None, placeholder="Select…", disabled=not code,
+                                              key=f"codemode_{n}")
+                    manual_code = ""
+                    if code_mode == "Enter code manually":
+                        manual_code = st.text_input("Enter BA Code", key=f"manualcode_{n}", disabled=not code,
+                                                    placeholder="e.g. MMUN011-09999")
+
+                # ---- 5) Entries (dynamic rows) ----
+                st.markdown("#### Entries")
+                st.caption("Add one or more entries for this BA, then save them all at once.")
+
+                row_inputs = []
+                to_remove = None
+                for idx, rid in enumerate(st.session_state.rows, start=1):
+                    with st.container(border=True):
+                        h = st.columns([6, 1])
+                        h[0].markdown(f"**Entry #{idx}**")
+                        if len(st.session_state.rows) > 1 and h[1].button("✕", key=f"rm_{rid}", help="Remove"):
+                            to_remove = rid
+                        d1, d2 = st.columns(2)
+                        forms = d1.text_input("Forms *", key=f"forms_{rid}", placeholder="whole number > 0")
+                        _f = (forms or "").strip()
+                        forms_v = parse_positive_int(_f) if _f else None
+                        if _f and (forms_v is None or forms_v <= 0):
+                            d1.caption(":red[⚠ Enter a whole number greater than 0]")
+                        supports = d2.text_input("Supports *", key=f"supports_{rid}", placeholder="whole number > 0")
+                        _s = (supports or "").strip()
+                        supports_v = parse_positive_int(_s) if _s else None
+                        if _s and (supports_v is None or supports_v <= 0):
+                            d2.caption(":red[⚠ Enter a whole number greater than 0]")
+                        if forms_v and forms_v > 0 and supports_v is not None and supports_v > 0:
+                            st.caption(f"ADS (Supports ÷ Forms) = **{round(supports_v / forms_v, ADS_DECIMALS)}**")
+                        row_inputs.append((idx, forms, supports))
+
+                if to_remove is not None:
+                    st.session_state.rows.remove(to_remove)
+                    st.rerun()
+
+                ca, cs = st.columns(2)
+                if ca.button("➕ Add another entry", use_container_width=True):
+                    st.session_state.rows.append(st.session_state.next_id)
+                    st.session_state.next_id += 1
+                    st.rerun()
+                save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True)
+
+                # --------------------------------------------------------------------------- #
+                #  Step 1: Validate + show preview (does NOT write to Google Sheets yet)
+                # --------------------------------------------------------------------------- #
+                if save_clicked:
+                    errors = []
+                    if not code:
+                        errors.append("Select a valid **owner code**.")
+
+                    # resolve BA: new vs existing
+                    nm = (new_ba_name or "").strip()
+                    if code_mode == "Unassigned":
+                        cd = "Unassigned"
+                    elif code_mode == "Enter code manually":
+                        cd = (manual_code or "").strip()
+                    else:
+                        cd = ""
+                    existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
+                    existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
+                    existing_lower |= {nm_.lower() for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas if owner_c == code}
+                    is_new, effective_ba = False, ""
+                    if nm:
+                        effective_ba = nm
+                        if nm.lower() not in existing_lower:
+                            is_new = True
+                            if not code_mode:
+                                errors.append("Choose a **New BA Code** option — *Unassigned* or *Enter code manually*.")
+                            elif code_mode == "Enter code manually" and not cd:
+                                errors.append("Enter the **BA Code**, or choose *Unassigned*.")
+                    elif ba_sel:
+                        effective_ba = ba_sel
+                    else:
+                        errors.append("Select a **BA Name**, or add a new one.")
+
+                    row_code = cd if is_new else name_to_code.get(effective_ba, "")
+
+                    # validate every entry row
+                    valid_rows = []
+                    for idx, forms, supports in row_inputs:
+                        forms = (forms or "").strip()
+                        supports = (supports or "").strip()
+                        forms_v = parse_positive_int(forms)
+                        supports_v = parse_positive_int(supports)
+
+                        if not any([forms, supports]):
+                            continue
+                        if forms_v is None or forms_v <= 0:
+                            errors.append(f"Entry #{idx}: **Forms** must be a whole number greater than 0.")
+                        if supports_v is None or supports_v <= 0:
+                            errors.append(f"Entry #{idx}: **Supports** must be a whole number greater than 0.")
+                        if forms_v is not None and forms_v > 0 and supports_v is not None and supports_v > 0:
+                            ads = str(round(supports_v / forms_v, ADS_DECIMALS))
+                            valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
+                                               "BAName": effective_ba, "BACode": row_code, "Clients": client or "",
+                                               "Forms": forms, "Supports": supports, "ADS": ads,
+                                               "No Forms": "0"})
+
+                    if not errors and not valid_rows:
+                        errors.append("Add at least one entry (Forms and Supports) before saving.")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                        # keep whatever is already staged in the preview; just don't add this invalid batch
+                    else:
+                        # accumulate validated rows into the running preview (NOT saved to Sheets yet)
+                        st.session_state.pending_preview.extend(valid_rows)
+                        # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
+                        if is_new and effective_ba:
+                            already = {(o, nm.lower()) for o, _c, nm, _jd in st.session_state.pending_new_bas}
+                            if (code, effective_ba.lower()) not in already:
+                                st.session_state.pending_new_bas.append(
+                                    (code, cd, effective_ba, signin.strftime("%Y-%m-%d"))
+                                )
+                        # clear for the next batch: keep owner code, sign-in date, and BA name;
+                        # reset only the "add a new BA" fields and the entry rows
+                        st.session_state.nonce += 1
+                        st.session_state.rows = [st.session_state.next_id]
+                        st.session_state.next_id += 1
+                        st.rerun()
+
+                # --------------------------------------------------------------------------- #
+                #  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
+                # --------------------------------------------------------------------------- #
+                if st.session_state.pending_preview:
+                    preview = st.session_state.pending_preview
+                    staged_new = st.session_state.pending_new_bas
+
+                    st.divider()
+                    st.subheader("📋 Preview — review before submitting")
+                    st.caption("Click any cell to fix a wrong entry, or remove a row with the 🗑 icon on the right.")
+
+                    preview_df = pd.DataFrame(preview)[HEADERS].copy()
+                    preview_df["Forms"] = pd.to_numeric(preview_df["Forms"], errors="coerce")
+                    preview_df["Supports"] = pd.to_numeric(preview_df["Supports"], errors="coerce")
+                    preview_df["ADS"] = pd.to_numeric(preview_df["ADS"], errors="coerce")
+                    preview_df.insert(0, "S.No", range(1, len(preview_df) + 1))
+                    edited_df = st.data_editor(
+                        preview_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        num_rows="dynamic",
+                        key=f"preview_editor_{st.session_state.preview_nonce}",
+                        column_config={
+                            "S.No": st.column_config.NumberColumn("S.No", disabled=True),
+                            "Forms": st.column_config.NumberColumn("Forms", min_value=1, step=1),
+                            "Supports": st.column_config.NumberColumn("Supports", min_value=1, step=1),
+                            "ADS": st.column_config.NumberColumn("ADS", disabled=True),
+                            "No Forms": st.column_config.TextColumn("No Forms", disabled=True),
+                        },
                     )
-                st.session_state.pending_preview = []
-                st.session_state.pending_new_bas = []
-                st.session_state.nonce += 1
-                st.session_state.ba_nonce += 1
-                st.session_state.rows = [st.session_state.next_id]
-                st.session_state.next_id += 1
+                    edited_records = edited_df.to_dict("records")
+                    ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
+                    st.info(
+                        f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
+                        "Add more BAs with **Save all entries**, or click **Submit** to write them all."
+                    )
+
+                    pc1, pc2 = st.columns(2)
+                    submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
+                    cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
+
+                    if cancel_clicked:
+                        st.session_state.pending_preview = []
+                        st.session_state.pending_new_bas = []
+                        st.session_state.preview_nonce += 1
+                        st.rerun()
+
+                    if submit_clicked:
+                        edit_errors, final_rows = validate_edited_rows(edited_records)
+                        if not edit_errors and not final_rows:
+                            edit_errors = ["Add at least one entry before submitting."]
+
+                        if edit_errors:
+                            for e in edit_errors:
+                                st.error(e)
+                        else:
+                            ok_to_save = True
+
+                            # 1) register any staged new BAs in the Admin sheet first
+                            if staged_new:
+                                try:
+                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
+                                        if cd and cd != "Unassigned" and cd in A["ba_codes"]:
+                                            st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
+                                    append_bas([(o, cd, nm, jd) for o, cd, nm, jd in staged_new])
+                                    load_admin.clear()
+                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
+                                        st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
+                                    added = ", ".join(f"{nm} ({cd})" for _o, cd, nm, _jd in staged_new)
+                                    st.success(f"➕ New BA(s) added to Admin sheet: {added}")
+                                except Exception as e:  # noqa: BLE001
+                                    ok_to_save = False
+                                    st.error(f"Couldn't update Admin sheet: {e}")
+
+                            # 2) write all entries
+                            if ok_to_save:
+                                try:
+                                    before, after = append_donations(final_rows)
+                                    added = after - before
+                                    st.session_state.session_entries.extend(final_rows)
+                                    if added < len(final_rows):
+                                        # The API returned success but fewer rows than expected landed.
+                                        st.warning(
+                                            f"Expected to add {len(final_rows)} row(s) but only {added} landed. "
+                                            "Please contact the admin to verify your data was saved correctly."
+                                        )
+                                    else:
+                                        final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
+                                        st.session_state.flash_success = (
+                                            f"✅ Submitted {len(final_rows)} entry(s) across {final_ba_count} BA(s)."
+                                        )
+                                    st.session_state.pending_preview = []
+                                    st.session_state.pending_new_bas = []
+                                    st.session_state.nonce += 1
+                                    st.session_state.ba_nonce += 1
+                                    st.session_state.preview_nonce += 1
+                                    st.session_state.rows = [st.session_state.next_id]
+                                    st.session_state.next_id += 1
+                                    st.rerun()
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(f"Couldn't save to Donations One-Off sheet: {e}")
+                                    if "403" in str(e) or "PERMISSION_DENIED" in str(e):
+                                        st.caption(
+                                            "**403 / permission denied** — the account the app signs in as cannot "
+                                            "edit that sheet. Open the Donations One-Off sheet, click **Share**, and give "
+                                            "**Editor** access to the right account (your Google login locally, or the "
+                                            "service-account email on Streamlit Cloud)."
+                                        )
+            else:
+                st.info(
+                    "BA and Entry details are disabled while **No Forms** is checked. "
+                    "Submitting will record a single entry marking no forms for this owner "
+                    "and date — there is no preview step."
+                )
+                nf_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
+                                              key=f"nf_submit_{n}")
+                if nf_submit_clicked:
+                    if not code:
+                        st.error("Select a valid **owner code**.")
+                    else:
+                        no_forms_row = {
+                            "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
+                            "BAName": "", "BACode": "", "Clients": client or "",
+                            "Forms": "", "Supports": "", "ADS": "", "No Forms": "1",
+                        }
+                        try:
+                            before, after = append_donations([no_forms_row])
+                            added = after - before
+                            st.session_state.session_entries.append(no_forms_row)
+                            if added < 1:
+                                st.warning(
+                                    "Expected to add 1 row but it did not land. "
+                                    "Please contact the admin to verify your data was saved correctly."
+                                )
+                            else:
+                                st.session_state.flash_success = (
+                                    f"✅ Submitted 1 'No Forms' entry for owner {code}."
+                                )
+                            st.session_state.nonce += 1
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"Couldn't save to Donations One-Off sheet: {e}")
+                            if "403" in str(e) or "PERMISSION_DENIED" in str(e):
+                                st.caption(
+                                    "**403 / permission denied** — the account the app signs in as cannot "
+                                    "edit that sheet. Open the Donations One-Off sheet, click **Share**, and give "
+                                    "**Editor** access to the right account (your Google login locally, or the "
+                                    "service-account email on Streamlit Cloud)."
+                                )
+
+
+with history_slot.container():
+    st.session_state.setdefault("show_owner_history", False)
+
+    if code and passcode_ok:
+        if st.session_state.show_owner_history:
+            if st.button("← Back to form"):
+                st.session_state.show_owner_history = False
                 st.rerun()
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Couldn't save to Donations One-Off sheet: {e}")
-                if "403" in str(e) or "PERMISSION_DENIED" in str(e):
-                    st.caption(
-                        "**403 / permission denied** — the account the app signs in as cannot "
-                        "edit that sheet. Open the Donations One-Off sheet, click **Share**, and give "
-                        "**Editor** access to the right account (your Google login locally, or the "
-                        "service-account email on Streamlit Cloud)."
-                    )
+        else:
+            if st.button("📊 View Owners Data History"):
+                st.session_state.show_owner_history = True
+                st.rerun()
+    else:
+        st.session_state.show_owner_history = False
+
+    if code and passcode_ok and st.session_state.show_owner_history:
+        owner_name_hist = A["owner_name_by_code"].get(code, "")
+        st.markdown(f"### Owners Data History — {code} · {owner_name_hist}")
+        st.markdown(
+            '<style>div[class*="st-key-entry_form"] { display: none; }</style>',
+            unsafe_allow_html=True,
+        )
+        try:
+            hist_df = load_donations_df()
+            owner_hist = hist_df[hist_df["OWNCODE"].astype(str).str.strip() == code]
+            owner_hist = owner_hist.sort_values("SigninDT", ascending=False)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Couldn't load history: {e}")
+            owner_hist = pd.DataFrame()
+        if owner_hist.empty:
+            st.info(f"No previous entries found for **{code} · {owner_name_hist}**.")
+        else:
+            st.caption(
+                f"{len(owner_hist)} previous entr{'y' if len(owner_hist) == 1 else 'ies'} "
+                f"for **{code} · {owner_name_hist}**"
+            )
+            st.dataframe(owner_hist[HEADERS], hide_index=True, use_container_width=True)
+
+            st.markdown("##### Download this owner's data for a date")
+            available_dates = sorted(owner_hist["SigninDT"].unique(), reverse=True)
+            dl1, dl2 = st.columns([2, 1], vertical_alignment="bottom")
+            selected_date = dl1.selectbox(
+                "Select a date",
+                available_dates,
+                key=f"hist_dl_date_{code}",
+            )
+            date_rows = owner_hist[owner_hist["SigninDT"] == selected_date][HEADERS]
+            dl2.download_button(
+                f"⬇ Download {selected_date} (.xlsx)",
+                data=df_to_xlsx_bytes(date_rows, sheet_title="History"),
+                file_name=f"{code}_{selected_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"hist_dl_btn_{code}",
+            )
 
 # --------------------------------------------------------------------------- #
 #  Submitted entries (this session) + downloads
