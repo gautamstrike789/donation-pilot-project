@@ -394,6 +394,18 @@ def session_xlsx_bytes(entries):
     return bio.getvalue()
 
 
+def df_to_xlsx_bytes(df, sheet_title="Sheet1"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    ws.append(list(df.columns))
+    for row in df.itertuples(index=False):
+        ws.append(list(row))
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 #  Guard + load
 # --------------------------------------------------------------------------- #
@@ -1015,6 +1027,24 @@ with history_slot.container():
                 f"for **{code} · {owner_name_hist}**"
             )
             st.dataframe(owner_hist[HEADERS], hide_index=True, use_container_width=True)
+
+            st.markdown("##### Download this owner's data for a date")
+            available_dates = sorted(owner_hist["SigninDT"].unique(), reverse=True)
+            dl1, dl2 = st.columns([2, 1], vertical_alignment="bottom")
+            selected_date = dl1.selectbox(
+                "Select a date",
+                available_dates,
+                key=f"hist_dl_date_{code}",
+            )
+            date_rows = owner_hist[owner_hist["SigninDT"] == selected_date][HEADERS]
+            dl2.download_button(
+                f"⬇ Download {selected_date} (.xlsx)",
+                data=df_to_xlsx_bytes(date_rows, sheet_title="History"),
+                file_name=f"{code}_{selected_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"hist_dl_btn_{code}",
+            )
 
 # --------------------------------------------------------------------------- #
 #  Submitted entries (this session) + downloads
