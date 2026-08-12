@@ -7,8 +7,10 @@ Streamlit app for owner/BA donation entry backed by Google Sheets.
 ```powershell
 python -m pip install -r requirements.txt
 python setup.py
-python setup_events.py     # one-time: adds the Events worksheet (Event dropdown source)
-python setup_airports.py   # one-time: adds the Airports worksheet (Airport dropdown source)
+python setup_events.py            # one-time: adds the Events worksheet (Event dropdown source)
+python setup_airports.py          # one-time: adds the Airports worksheet (Airport dropdown source)
+python setup_owner_passcodes.py   # one-time: adds the Passcode column to Owners
+python setup_ba_joinee_date.py    # one-time: adds the New Joinee Date column to BAs
 python -m streamlit run app.py
 ```
 
@@ -22,6 +24,26 @@ Donations sheet, right after `SOD`. `OwnerName` is also saved next to `OWNCODE`,
 looked up automatically from the Owners worksheet. The preview step before
 Submit is an editable grid — fix a wrong entry or delete a row before writing
 to the sheet.
+
+### Owner passcode gate
+
+The Owners worksheet has a `Passcode` column (added by `setup_owner_passcodes.py`).
+It's self-service: the first time anyone picks an owner whose `Passcode` cell is
+blank, the form asks them to set one (typed twice to confirm) and saves it to
+that cell automatically — no admin step needed. From then on, picking that owner
+shows a passcode box that blocks SignIn Date, BA, Donations, and the Owners Data
+History view until the correct passcode is entered (once per browser session).
+Clear an owner's `Passcode` cell yourself if you want the "set a passcode" prompt
+to run again for them. New owners you add to the sheet get the same column
+automatically.
+
+### New BA joinee date
+
+The BAs worksheet has a `New Joinee Date` column (added by `setup_ba_joinee_date.py`).
+When someone adds a brand-new BA through the form's "Add a new BA" section, the
+SignIn Date used for that submission is written into this column automatically.
+It's for the Admin sheet's own record-keeping only — the form's BA dropdown still
+only ever shows "BA Name · BA Code", unchanged.
 
 ## One-Off form
 
