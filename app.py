@@ -237,76 +237,80 @@ def _get_status_code(e):
     return None
 
 
-def _col_letter(n):
-    """1 -> A, 2 -> B, ... 27 -> AA, etc."""
-    letters = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
+def _append_with_retry(ws, rows, cache_keys, max_attempts=8, max_verify_rounds=5):
+    """Append rows with exponential backoff for 429 (rate limit), automatic
+    session reset for 401/403 (expired token), and — critically — a
+    verify-by-content pass after every write.
 
-
-def _append_with_retry(ws, rows, cache_keys, max_attempts=8):
-    """Append rows with exponential backoff for 429 (rate limit) and
-    automatic session reset for 401/403 (expired token).
-    cache_keys: tuple of session_state keys to clear on auth failure.
-
-    Writes to an explicitly-computed row range instead of using
-    ws.append_rows(): both the Donations and BAs sheets have a Google
-    Sheets filter applied, and append_rows's automatic "find the table"
-    logic can misdetect the table extent on a filtered sheet — landing
-    new rows at row 2 (INSERT_ROWS) or, worse, overwriting row 2 entirely
-    (the API's default OVERWRITE mode) instead of appending at the true
-    bottom. An explicit range sidesteps that detection altogether."""
+    Under a real concurrent-submission stress test, ws.append_rows() was
+    observed to occasionally report success while a batch of rows never
+    actually landed in the sheet — no exception, no error, just silently
+    fewer rows than expected. (This is distinct from the earlier
+    table-detection bug on a filtered sheet, which has its own fix; this is
+    Google's API itself, under enough concurrent load, not guaranteeing
+    every "successful" append call's data is durably visible.) So after
+    writing, we re-read the sheet and check, by exact content, which of the
+    rows we sent are actually present; anything missing gets resent — and
+    only the missing ones, so a resend can never create a duplicate of a
+    row that did land."""
     notice = st.empty()
     try:
-        for attempt in range(max_attempts):
-            try:
-                start_row = len(ws.get_all_values()) + 1
-                end_row = start_row + len(rows) - 1
-                end_col = _col_letter(len(rows[0]))
-                ws.update(
-                    range_name=f"A{start_row}:{end_col}{end_row}",
-                    values=rows,
-                    value_input_option="RAW",
-                )
+        remaining = list(rows)
+        for verify_round in range(max_verify_rounds):
+            if not remaining:
                 return
-            except gspread.exceptions.APIError as e:
-                code = _get_status_code(e)
-                if code == 429 and attempt < max_attempts - 1:
-                    wait = 2 ** attempt  # 1, 2, 4, 8, 16, 32, 64 s
-                    notice.warning(
-                        f"High traffic detected — your data is safe and will be saved "
-                        f"in {wait} second{'s' if wait > 1 else ''}. "
-                        f"Please do not close this tab. "
-                        f"(Retry {attempt + 1} of {max_attempts - 1}, "
-                        f"max wait {2 ** (max_attempts - 1) - 1}s)"
-                    )
-                    time.sleep(wait)
-                elif code in (401, 403) and attempt == 0:
-                    # Token expired mid-session: drop cached gc + worksheet and retry once
-                    notice.warning("Re-authenticating with Google — please wait a moment...")
-                    for k in ("gc", *cache_keys):
-                        st.session_state.pop(k, None)
-                    creds = get_credentials()
-                    st.session_state.gc = gspread.authorize(creds)
-                    cfg = load_config()
-                    # Rebuild whichever worksheet we're writing to
-                    for ck in cache_keys:
-                        if ck == "_ws_donations":
-                            sh = st.session_state.gc.open_by_key(cfg["donations_sheet_id"])
-                            st.session_state[ck] = sh.sheet1
-                            ws = st.session_state[ck]
-                        elif ck == "_ws_bas":
-                            sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
-                            st.session_state[ck] = sh.worksheet("BAs")
-                            ws = st.session_state[ck]
-                        elif ck == "_ws_owners":
-                            sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
-                            st.session_state[ck] = sh.worksheet("Owners")
-                            ws = st.session_state[ck]
-                else:
-                    raise
+            for attempt in range(max_attempts):
+                try:
+                    ws.append_rows(remaining, value_input_option="RAW")
+                    break
+                except gspread.exceptions.APIError as e:
+                    code = _get_status_code(e)
+                    if code == 429 and attempt < max_attempts - 1:
+                        wait = 2 ** attempt  # 1, 2, 4, 8, 16, 32, 64 s
+                        notice.warning(
+                            f"High traffic detected — your data is safe and will be saved "
+                            f"in {wait} second{'s' if wait > 1 else ''}. "
+                            f"Please do not close this tab. "
+                            f"(Retry {attempt + 1} of {max_attempts - 1}, "
+                            f"max wait {2 ** (max_attempts - 1) - 1}s)"
+                        )
+                        time.sleep(wait)
+                    elif code in (401, 403) and attempt == 0:
+                        # Token expired mid-session: drop cached gc + worksheet and retry once
+                        notice.warning("Re-authenticating with Google — please wait a moment...")
+                        for k in ("gc", *cache_keys):
+                            st.session_state.pop(k, None)
+                        creds = get_credentials()
+                        st.session_state.gc = gspread.authorize(creds)
+                        cfg = load_config()
+                        # Rebuild whichever worksheet we're writing to
+                        for ck in cache_keys:
+                            if ck == "_ws_donations":
+                                sh = st.session_state.gc.open_by_key(cfg["donations_sheet_id"])
+                                st.session_state[ck] = sh.sheet1
+                                ws = st.session_state[ck]
+                            elif ck == "_ws_bas":
+                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
+                                st.session_state[ck] = sh.worksheet("BAs")
+                                ws = st.session_state[ck]
+                            elif ck == "_ws_owners":
+                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
+                                st.session_state[ck] = sh.worksheet("Owners")
+                                ws = st.session_state[ck]
+                    else:
+                        raise
+
+            time.sleep(0.5)
+            after_set = {tuple(r) for r in ws.get_all_values()}
+            remaining = [r for r in remaining if tuple(r) not in after_set]
+            if remaining and verify_round < max_verify_rounds - 1:
+                time.sleep(0.5 * (verify_round + 1))
+
+        if remaining:
+            raise RuntimeError(
+                f"{len(remaining)} of {len(rows)} row(s) could not be confirmed as "
+                "written to the sheet after several attempts."
+            )
     finally:
         notice.empty()
 
@@ -482,6 +486,8 @@ st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the A
 st.session_state.setdefault("flash_success", None)    # confirmation message that survives the post-submit rerun
 st.session_state.setdefault("preview_nonce", 0)       # rotated whenever pending_preview resets, so the
                                                        # preview editor widget doesn't carry over stale edits
+st.session_state.setdefault("submitting", False)      # guards against a duplicate Submit click resubmitting
+                                                       # the same staged rows before the first write finishes
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
 
@@ -626,274 +632,287 @@ if code:
 
 history_slot = st.empty()
 
-if code and passcode_ok:
-    with st.container(key="entry_form"):
-        # ---- 2) SignIn Date ----
-        signin = st.date_input("2 · SignIn Date *", value=None, format="YYYY-MM-DD", key="signin")
+if code and not passcode_ok:
+    st.markdown(
+        '<style>div[class*="st-key-entry_form"] { display: none; }</style>',
+        unsafe_allow_html=True,
+    )
 
-        if not signin:
-            st.info("Select the **SignIn Date** above to continue.")
-        else:
-            # ---- NO Production ----
-            no_production = st.checkbox(
-                "NO Production — this owner has no donations to report for this sign-in",
-                key=f"noprod_{n}",
+with st.container(key="entry_form"):
+    # ---- 2) SignIn Date ----
+    signin = st.date_input("2 · SignIn Date *", value=None, format="YYYY-MM-DD", key="signin")
+
+    if not signin:
+        st.info("Select the **SignIn Date** above to continue.")
+    else:
+        # ---- NO Production ----
+        no_production = st.checkbox(
+            "NO Production — this owner has no donations to report for this sign-in",
+            key=f"noprod_{n}",
+        )
+
+        if not no_production:
+            # ---- 3) BA Name (shows "Name · BACode"; key includes code so it resets when owner changes) ----
+            combined = {}
+            for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
+                combined[nm_] = cd_
+            for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
+                combined.setdefault(nm_, cd_)
+            if code:
+                for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas:
+                    if owner_c == code:
+                        combined.setdefault(nm_, cd_)
+            ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
+            ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
+            label_to_name = {(f"{nm_}  ·  {cd_}" if cd_ else nm_): nm_ for nm_, cd_ in ba_pairs}
+            name_to_code = {nm_: cd_ for nm_, cd_ in ba_pairs}
+
+            new_name_typed = bool(str(st.session_state.get(f"newname_{n}", "") or "").strip())
+            if not code:
+                ba_ph = "Select owner code first…"
+            elif new_name_typed:
+                ba_ph = "Disabled — you're adding a new BA below"
+            else:
+                ba_ph = "Search BA name or code…"
+
+            ba_sel_label = st.selectbox(
+                "3 · BA Name *",
+                ba_labels,
+                index=None,
+                placeholder=ba_ph,
+                disabled=(not code) or new_name_typed,
+                key=f"ba_{bn}_{code or 'x'}",
             )
+            ba_sel = None if new_name_typed else (label_to_name.get(ba_sel_label) if ba_sel_label else None)
 
-            if not no_production:
-                # ---- 3) BA Name (shows "Name · BACode"; key includes code so it resets when owner changes) ----
-                combined = {}
-                for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
-                    combined[nm_] = cd_
-                for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
-                    combined.setdefault(nm_, cd_)
-                if code:
-                    for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas:
-                        if owner_c == code:
-                            combined.setdefault(nm_, cd_)
-                ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
-                ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
-                label_to_name = {(f"{nm_}  ·  {cd_}" if cd_ else nm_): nm_ for nm_, cd_ in ba_pairs}
-                name_to_code = {nm_: cd_ for nm_, cd_ in ba_pairs}
+            # ---- 4) Add a new BA (optional) ----
+            with st.container(border=True):
+                st.markdown("**➕ Add a new BA**  — fill these only if the BA isn't in the list above")
+                nb1, nb2 = st.columns(2)
+                new_ba_name = nb1.text_input("New BA Name", key=f"newname_{n}", disabled=not code,
+                                             placeholder="Full name")
+                code_mode = nb2.selectbox("New BA Code", ["Unassigned", "Enter code manually"],
+                                          index=None, placeholder="Select…", disabled=not code,
+                                          key=f"codemode_{n}")
+                manual_code = ""
+                if code_mode == "Enter code manually":
+                    manual_code = st.text_input("Enter BA Code", key=f"manualcode_{n}", disabled=not code,
+                                                placeholder="e.g. MMUN011-09999")
 
-                new_name_typed = bool(str(st.session_state.get(f"newname_{n}", "") or "").strip())
-                if not code:
-                    ba_ph = "Select owner code first…"
-                elif new_name_typed:
-                    ba_ph = "Disabled — you're adding a new BA below"
-                else:
-                    ba_ph = "Search BA name or code…"
+            # ---- 5) Donations (dynamic rows) ----
+            st.markdown("#### Donations")
+            st.caption("Add one or more donations for this BA, then save them all at once.")
 
-                ba_sel_label = st.selectbox(
-                    "3 · BA Name *",
-                    ba_labels,
-                    index=None,
-                    placeholder=ba_ph,
-                    disabled=(not code) or new_name_typed,
-                    key=f"ba_{bn}_{code or 'x'}",
-                )
-                ba_sel = None if new_name_typed else (label_to_name.get(ba_sel_label) if ba_sel_label else None)
-
-                # ---- 4) Add a new BA (optional) ----
+            row_inputs = []
+            to_remove = None
+            for idx, rid in enumerate(st.session_state.rows, start=1):
                 with st.container(border=True):
-                    st.markdown("**➕ Add a new BA**  — fill these only if the BA isn't in the list above")
-                    nb1, nb2 = st.columns(2)
-                    new_ba_name = nb1.text_input("New BA Name", key=f"newname_{n}", disabled=not code,
-                                                 placeholder="Full name")
-                    code_mode = nb2.selectbox("New BA Code", ["Unassigned", "Enter code manually"],
-                                              index=None, placeholder="Select…", disabled=not code,
-                                              key=f"codemode_{n}")
-                    manual_code = ""
-                    if code_mode == "Enter code manually":
-                        manual_code = st.text_input("Enter BA Code", key=f"manualcode_{n}", disabled=not code,
-                                                    placeholder="e.g. MMUN011-09999")
+                    h = st.columns([6, 1])
+                    h[0].markdown(f"**Donation #{idx}**")
+                    if len(st.session_state.rows) > 1 and h[1].button("✕", key=f"rm_{rid}", help="Remove"):
+                        to_remove = rid
+                    d1, d2 = st.columns(2)
+                    amt = d1.text_input("Amount (Amt) *", key=f"amt_{rid}", placeholder="min 499")
+                    _a = (amt or "").strip()
+                    if _a:
+                        try:
+                            if float(_a) < 499:
+                                d1.caption(":red[⚠ Amount must be 499 or more]")
+                        except ValueError:
+                            d1.caption(":red[⚠ Enter a valid number]")
+                    age = d2.text_input("Age *", key=f"age_{rid}", placeholder="25–99")
+                    _g = (age or "").strip()
+                    if _g:
+                        age_hint_value = parse_age_value(_g)
+                        if age_hint_value is None or not (24 < age_hint_value < 100):
+                            d2.caption(":red[⚠ Enter a whole number]")
+                    sod = st.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
+                                       placeholder="Select a source…", key=f"sod_{rid}")
 
-                # ---- 5) Donations (dynamic rows) ----
-                st.markdown("#### Donations")
-                st.caption("Add one or more donations for this BA, then save them all at once.")
+                    event_name, airport_name = "", ""
+                    if sod == "Events":
+                        owner_events = A["events_by_code"].get(code, []) if code else []
+                        if not code:
+                            st.selectbox("Event Name *", [], index=None, disabled=True,
+                                         placeholder="Select owner code first…", key=f"event_ph_{rid}")
+                        elif not owner_events:
+                            st.selectbox("Event Name *", [], index=None, disabled=True,
+                                         placeholder="No events mapped for this owner", key=f"event_ph_{rid}")
+                        else:
+                            event_name = st.selectbox("Event Name *", owner_events, index=None,
+                                                      placeholder="Select an event…", key=f"event_{rid}")
+                    elif sod == "Airport":
+                        airport_name = st.selectbox("Airport Name *", A["airport_options"], index=None,
+                                                    placeholder="Select an airport…", key=f"airport_{rid}")
 
-                row_inputs = []
-                to_remove = None
-                for idx, rid in enumerate(st.session_state.rows, start=1):
-                    with st.container(border=True):
-                        h = st.columns([6, 1])
-                        h[0].markdown(f"**Donation #{idx}**")
-                        if len(st.session_state.rows) > 1 and h[1].button("✕", key=f"rm_{rid}", help="Remove"):
-                            to_remove = rid
-                        d1, d2 = st.columns(2)
-                        amt = d1.text_input("Amount (Amt) *", key=f"amt_{rid}", placeholder="min 499")
-                        _a = (amt or "").strip()
-                        if _a:
-                            try:
-                                if float(_a) < 499:
-                                    d1.caption(":red[⚠ Amount must be 499 or more]")
-                            except ValueError:
-                                d1.caption(":red[⚠ Enter a valid number]")
-                        age = d2.text_input("Age *", key=f"age_{rid}", placeholder="25–99")
-                        _g = (age or "").strip()
-                        if _g:
-                            age_hint_value = parse_age_value(_g)
-                            if age_hint_value is None or not (24 < age_hint_value < 100):
-                                d2.caption(":red[⚠ Enter a whole number]")
-                        sod = st.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
-                                           placeholder="Select a source…", key=f"sod_{rid}")
+                    row_inputs.append((idx, amt, age, sod, event_name, airport_name))
 
-                        event_name, airport_name = "", ""
-                        if sod == "Events":
-                            owner_events = A["events_by_code"].get(code, []) if code else []
-                            if not code:
-                                st.selectbox("Event Name *", [], index=None, disabled=True,
-                                             placeholder="Select owner code first…", key=f"event_ph_{rid}")
-                            elif not owner_events:
-                                st.selectbox("Event Name *", [], index=None, disabled=True,
-                                             placeholder="No events mapped for this owner", key=f"event_ph_{rid}")
-                            else:
-                                event_name = st.selectbox("Event Name *", owner_events, index=None,
-                                                          placeholder="Select an event…", key=f"event_{rid}")
-                        elif sod == "Airport":
-                            airport_name = st.selectbox("Airport Name *", A["airport_options"], index=None,
-                                                        placeholder="Select an airport…", key=f"airport_{rid}")
+            if to_remove is not None:
+                st.session_state.rows.remove(to_remove)
+                st.rerun()
 
-                        row_inputs.append((idx, amt, age, sod, event_name, airport_name))
+            ca, cs = st.columns(2)
+            if ca.button("➕ Add another donation", use_container_width=True):
+                st.session_state.rows.append(st.session_state.next_id)
+                st.session_state.next_id += 1
+                st.rerun()
+            save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True)
 
-                if to_remove is not None:
-                    st.session_state.rows.remove(to_remove)
-                    st.rerun()
+            # --------------------------------------------------------------------------- #
+            #  Step 1: Validate + show preview (does NOT write to Google Sheets yet)
+            # --------------------------------------------------------------------------- #
+            if save_clicked:
+                errors = []
+                if not code:
+                    errors.append("Select a valid **owner code**.")
 
-                ca, cs = st.columns(2)
-                if ca.button("➕ Add another donation", use_container_width=True):
-                    st.session_state.rows.append(st.session_state.next_id)
+                # resolve BA: new vs existing
+                nm = (new_ba_name or "").strip()
+                if code_mode == "Unassigned":
+                    cd = "Unassigned"
+                elif code_mode == "Enter code manually":
+                    cd = (manual_code or "").strip()
+                else:
+                    cd = ""
+                existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
+                existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
+                existing_lower |= {nm_.lower() for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas if owner_c == code}
+                is_new, effective_ba = False, ""
+                if nm:
+                    effective_ba = nm
+                    if nm.lower() not in existing_lower:
+                        is_new = True
+                        if not code_mode:
+                            errors.append("Choose a **New BA Code** option — *Unassigned* or *Enter code manually*.")
+                        elif code_mode == "Enter code manually" and not cd:
+                            errors.append("Enter the **BA Code**, or choose *Unassigned*.")
+                elif ba_sel:
+                    effective_ba = ba_sel
+                else:
+                    errors.append("Select a **BA Name**, or add a new one.")
+
+                row_code = cd if is_new else name_to_code.get(effective_ba, "")
+
+                # validate every donation row
+                valid_rows = []
+                for idx, amt, age, sod, event_name, airport_name in row_inputs:
+                    amt = (amt or "").strip()
+                    age = (age or "").strip()
+                    try:
+                        amt_v = float(amt)
+                    except ValueError:
+                        amt_v = None
+                    age_v = parse_age_value(age)
+
+                    if not any([amt, age, sod]):
+                        continue
+                    if amt_v is None or amt_v < 499:
+                        errors.append(f"Donation #{idx}: amount must be **499 or more**.")
+                    if age_v is None or not (24 < age_v < 100):
+                        errors.append(f"Donation #{idx}: age must be **between 25 and 99**.")
+                    if not sod:
+                        errors.append(f"Donation #{idx}: select a **source of donation**.")
+                    elif sod == "Events" and not event_name:
+                        errors.append(f"Donation #{idx}: select an **event name**.")
+                    elif sod == "Airport" and not airport_name:
+                        errors.append(f"Donation #{idx}: select an **airport**.")
+                    if (amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod
+                            and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)):
+                        owner_name = A["owner_meta"].get(code, ("", ""))[0]
+                        valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
+                                           "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
+                                           "Amount(Amt)": amt, "Age": age, "SOD": sod,
+                                           "Event Name": event_name, "Airport Name": airport_name,
+                                           "NO Production": "0"})
+
+                if not errors and not valid_rows:
+                    errors.append("Add at least one donation (amount, age, source) before saving.")
+
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                    # keep whatever is already staged in the preview; just don't add this invalid batch
+                else:
+                    # accumulate validated rows into the running preview (NOT saved to Sheets yet)
+                    st.session_state.pending_preview.extend(valid_rows)
+                    # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
+                    if is_new and effective_ba:
+                        already = {(o, nm.lower()) for o, _c, nm, _jd in st.session_state.pending_new_bas}
+                        if (code, effective_ba.lower()) not in already:
+                            st.session_state.pending_new_bas.append(
+                                (code, cd, effective_ba, signin.strftime("%Y-%m-%d"))
+                            )
+                    # clear for the next batch: keep owner code, sign-in date, and BA name;
+                    # reset only the "add a new BA" fields and the donation rows
+                    st.session_state.nonce += 1
+                    st.session_state.rows = [st.session_state.next_id]
                     st.session_state.next_id += 1
                     st.rerun()
-                save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True)
 
-                # --------------------------------------------------------------------------- #
-                #  Step 1: Validate + show preview (does NOT write to Google Sheets yet)
-                # --------------------------------------------------------------------------- #
-                if save_clicked:
-                    errors = []
-                    if not code:
-                        errors.append("Select a valid **owner code**.")
+            # --------------------------------------------------------------------------- #
+            #  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
+            # --------------------------------------------------------------------------- #
+            if st.session_state.pending_preview:
+                preview = st.session_state.pending_preview
+                staged_new = st.session_state.pending_new_bas
 
-                    # resolve BA: new vs existing
-                    nm = (new_ba_name or "").strip()
-                    if code_mode == "Unassigned":
-                        cd = "Unassigned"
-                    elif code_mode == "Enter code manually":
-                        cd = (manual_code or "").strip()
-                    else:
-                        cd = ""
-                    existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
-                    existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
-                    existing_lower |= {nm_.lower() for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas if owner_c == code}
-                    is_new, effective_ba = False, ""
-                    if nm:
-                        effective_ba = nm
-                        if nm.lower() not in existing_lower:
-                            is_new = True
-                            if not code_mode:
-                                errors.append("Choose a **New BA Code** option — *Unassigned* or *Enter code manually*.")
-                            elif code_mode == "Enter code manually" and not cd:
-                                errors.append("Enter the **BA Code**, or choose *Unassigned*.")
-                    elif ba_sel:
-                        effective_ba = ba_sel
-                    else:
-                        errors.append("Select a **BA Name**, or add a new one.")
+                st.divider()
+                st.subheader("📋 Preview — review before submitting")
+                st.caption("Click any cell to fix a wrong entry, or remove a row with the 🗑 icon on the right.")
 
-                    row_code = cd if is_new else name_to_code.get(effective_ba, "")
+                preview_df = pd.DataFrame(preview)[HEADERS].copy()
+                preview_df["Amount(Amt)"] = pd.to_numeric(preview_df["Amount(Amt)"], errors="coerce")
+                preview_df["Age"] = pd.to_numeric(preview_df["Age"], errors="coerce")
+                preview_df.insert(0, "S.No", range(1, len(preview_df) + 1))
+                edited_df = st.data_editor(
+                    preview_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="dynamic",
+                    key=f"preview_editor_{st.session_state.preview_nonce}",
+                    column_config={
+                        "S.No": st.column_config.NumberColumn("S.No", disabled=True),
+                        "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
+                        "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
+                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
+                        "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=A["airport_options"]),
+                        "NO Production": st.column_config.TextColumn("NO Production", disabled=True),
+                    },
+                )
+                edited_records = edited_df.to_dict("records")
+                ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
+                st.info(
+                    f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
+                    "Add more BAs with **Save all entries**, or click **Submit** to write them all."
+                )
 
-                    # validate every donation row
-                    valid_rows = []
-                    for idx, amt, age, sod, event_name, airport_name in row_inputs:
-                        amt = (amt or "").strip()
-                        age = (age or "").strip()
-                        try:
-                            amt_v = float(amt)
-                        except ValueError:
-                            amt_v = None
-                        age_v = parse_age_value(age)
+                pc1, pc2 = st.columns(2)
+                submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
+                cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
 
-                        if not any([amt, age, sod]):
-                            continue
-                        if amt_v is None or amt_v < 499:
-                            errors.append(f"Donation #{idx}: amount must be **499 or more**.")
-                        if age_v is None or not (24 < age_v < 100):
-                            errors.append(f"Donation #{idx}: age must be **between 25 and 99**.")
-                        if not sod:
-                            errors.append(f"Donation #{idx}: select a **source of donation**.")
-                        elif sod == "Events" and not event_name:
-                            errors.append(f"Donation #{idx}: select an **event name**.")
-                        elif sod == "Airport" and not airport_name:
-                            errors.append(f"Donation #{idx}: select an **airport**.")
-                        if (amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod
-                                and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)):
-                            owner_name = A["owner_meta"].get(code, ("", ""))[0]
-                            valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
-                                               "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
-                                               "Amount(Amt)": amt, "Age": age, "SOD": sod,
-                                               "Event Name": event_name, "Airport Name": airport_name,
-                                               "NO Production": "0"})
+                if cancel_clicked:
+                    st.session_state.pending_preview = []
+                    st.session_state.pending_new_bas = []
+                    st.session_state.preview_nonce += 1
+                    st.rerun()
 
-                    if not errors and not valid_rows:
-                        errors.append("Add at least one donation (amount, age, source) before saving.")
+                if submit_clicked:
+                    edit_errors, final_rows = validate_edited_rows(edited_records)
+                    if not edit_errors and not final_rows:
+                        edit_errors = ["Add at least one donation before submitting."]
 
-                    if errors:
-                        for e in errors:
+                    if edit_errors:
+                        for e in edit_errors:
                             st.error(e)
-                        # keep whatever is already staged in the preview; just don't add this invalid batch
+                    elif st.session_state.get("submitting"):
+                        # A submission from a moment ago (e.g. a double-click, or a slow
+                        # 429 retry) is still in flight for this session. Processing this
+                        # click too would submit the same staged rows a second time —
+                        # skip instead of resubmitting.
+                        st.warning("A submission is already in progress — please wait a moment.")
                     else:
-                        # accumulate validated rows into the running preview (NOT saved to Sheets yet)
-                        st.session_state.pending_preview.extend(valid_rows)
-                        # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
-                        if is_new and effective_ba:
-                            already = {(o, nm.lower()) for o, _c, nm, _jd in st.session_state.pending_new_bas}
-                            if (code, effective_ba.lower()) not in already:
-                                st.session_state.pending_new_bas.append(
-                                    (code, cd, effective_ba, signin.strftime("%Y-%m-%d"))
-                                )
-                        # clear for the next batch: keep owner code, sign-in date, and BA name;
-                        # reset only the "add a new BA" fields and the donation rows
-                        st.session_state.nonce += 1
-                        st.session_state.rows = [st.session_state.next_id]
-                        st.session_state.next_id += 1
-                        st.rerun()
-
-                # --------------------------------------------------------------------------- #
-                #  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
-                # --------------------------------------------------------------------------- #
-                if st.session_state.pending_preview:
-                    preview = st.session_state.pending_preview
-                    staged_new = st.session_state.pending_new_bas
-
-                    st.divider()
-                    st.subheader("📋 Preview — review before submitting")
-                    st.caption("Click any cell to fix a wrong entry, or remove a row with the 🗑 icon on the right.")
-
-                    preview_df = pd.DataFrame(preview)[HEADERS].copy()
-                    preview_df["Amount(Amt)"] = pd.to_numeric(preview_df["Amount(Amt)"], errors="coerce")
-                    preview_df["Age"] = pd.to_numeric(preview_df["Age"], errors="coerce")
-                    preview_df.insert(0, "S.No", range(1, len(preview_df) + 1))
-                    edited_df = st.data_editor(
-                        preview_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        num_rows="dynamic",
-                        key=f"preview_editor_{st.session_state.preview_nonce}",
-                        column_config={
-                            "S.No": st.column_config.NumberColumn("S.No", disabled=True),
-                            "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
-                            "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
-                            "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
-                            "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=A["airport_options"]),
-                            "NO Production": st.column_config.TextColumn("NO Production", disabled=True),
-                        },
-                    )
-                    edited_records = edited_df.to_dict("records")
-                    ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
-                    st.info(
-                        f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
-                        "Add more BAs with **Save all entries**, or click **Submit** to write them all."
-                    )
-
-                    pc1, pc2 = st.columns(2)
-                    submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
-                    cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
-
-                    if cancel_clicked:
-                        st.session_state.pending_preview = []
-                        st.session_state.pending_new_bas = []
-                        st.session_state.preview_nonce += 1
-                        st.rerun()
-
-                    if submit_clicked:
-                        edit_errors, final_rows = validate_edited_rows(edited_records)
-                        if not edit_errors and not final_rows:
-                            edit_errors = ["Add at least one donation before submitting."]
-
-                        if edit_errors:
-                            for e in edit_errors:
-                                st.error(e)
-                        else:
+                        st.session_state.submitting = True
+                        try:
                             ok_to_save = True
 
                             # 1) register any staged new BAs in the Admin sheet first
@@ -917,26 +936,32 @@ if code and passcode_ok:
                                 try:
                                     before, after = append_donations(final_rows)
                                     added = after - before
-                                    st.session_state.session_entries.extend(final_rows)
-                                    if added < len(final_rows):
-                                        # The API returned success but fewer rows than expected landed.
-                                        st.warning(
-                                            f"Expected to add {len(final_rows)} row(s) but only {added} landed. "
-                                            "Please contact the admin to verify your data was saved correctly."
-                                        )
-                                    else:
+                                    if added == len(final_rows):
+                                        # Confirmed: exactly what we sent landed. Only now is it
+                                        # safe to mark this submitted and clear the preview —
+                                        # otherwise a shortfall would silently vanish from the
+                                        # UI while the "submitted entries" download still claimed
+                                        # it was saved.
+                                        st.session_state.session_entries.extend(final_rows)
                                         final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
                                         st.session_state.flash_success = (
                                             f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s)."
                                         )
-                                    st.session_state.pending_preview = []
-                                    st.session_state.pending_new_bas = []
-                                    st.session_state.nonce += 1
-                                    st.session_state.ba_nonce += 1
-                                    st.session_state.preview_nonce += 1
-                                    st.session_state.rows = [st.session_state.next_id]
-                                    st.session_state.next_id += 1
-                                    st.rerun()
+                                        st.session_state.pending_preview = []
+                                        st.session_state.pending_new_bas = []
+                                        st.session_state.nonce += 1
+                                        st.session_state.ba_nonce += 1
+                                        st.session_state.preview_nonce += 1
+                                        st.session_state.rows = [st.session_state.next_id]
+                                        st.session_state.next_id += 1
+                                        st.rerun()
+                                    else:
+                                        st.error(
+                                            f"Expected to add {len(final_rows)} row(s) but the sheet's row "
+                                            f"count only increased by {added}. Nothing has been cleared from "
+                                            "your preview — check the Donations sheet before retrying, and "
+                                            "contact the admin if you're unsure."
+                                        )
                                 except Exception as e:  # noqa: BLE001
                                     st.error(f"Couldn't save to Donations sheet: {e}")
                                     if "403" in str(e) or "PERMISSION_DENIED" in str(e):
@@ -946,18 +971,24 @@ if code and passcode_ok:
                                             "**Editor** access to the right account (your Google login locally, or the "
                                             "service-account email on Streamlit Cloud)."
                                         )
-            else:
-                st.info(
-                    "BA and Donation details are disabled while **NO Production** is checked. "
-                    "Submitting will record a single entry marking no production for this owner "
-                    "and date — there is no preview step."
-                )
-                np_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
-                                              key=f"np_submit_{n}")
-                if np_submit_clicked:
-                    if not code:
-                        st.error("Select a valid **owner code**.")
-                    else:
+                        finally:
+                            st.session_state.submitting = False
+        else:
+            st.info(
+                "BA and Donation details are disabled while **NO Production** is checked. "
+                "Submitting will record a single entry marking no production for this owner "
+                "and date — there is no preview step."
+            )
+            np_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
+                                          key=f"np_submit_{n}")
+            if np_submit_clicked:
+                if not code:
+                    st.error("Select a valid **owner code**.")
+                elif st.session_state.get("submitting"):
+                    st.warning("A submission is already in progress — please wait a moment.")
+                else:
+                    st.session_state.submitting = True
+                    try:
                         owner_name = A["owner_meta"].get(code, ("", ""))[0]
                         no_prod_row = {
                             "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
@@ -967,18 +998,19 @@ if code and passcode_ok:
                         try:
                             before, after = append_donations([no_prod_row])
                             added = after - before
-                            st.session_state.session_entries.append(no_prod_row)
-                            if added < 1:
-                                st.warning(
-                                    "Expected to add 1 row but it did not land. "
-                                    "Please contact the admin to verify your data was saved correctly."
-                                )
-                            else:
+                            if added == 1:
+                                st.session_state.session_entries.append(no_prod_row)
                                 st.session_state.flash_success = (
                                     f"✅ Submitted 1 'NO Production' entry for owner {code}."
                                 )
-                            st.session_state.nonce += 1
-                            st.rerun()
+                                st.session_state.nonce += 1
+                                st.rerun()
+                            else:
+                                st.error(
+                                    "Expected to add 1 row but the sheet's row count didn't increase by 1. "
+                                    "Nothing has been recorded as submitted — check the Donations sheet "
+                                    "before retrying, and contact the admin if you're unsure."
+                                )
                         except Exception as e:  # noqa: BLE001
                             st.error(f"Couldn't save to Donations sheet: {e}")
                             if "403" in str(e) or "PERMISSION_DENIED" in str(e):
@@ -988,6 +1020,8 @@ if code and passcode_ok:
                                     "**Editor** access to the right account (your Google login locally, or the "
                                     "service-account email on Streamlit Cloud)."
                                 )
+                    finally:
+                        st.session_state.submitting = False
 
 
 with history_slot.container():
