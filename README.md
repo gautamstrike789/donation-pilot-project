@@ -50,16 +50,26 @@ only ever shows "BA Name · BA Code", unchanged.
 `app_oneoff.py` is a second, fully independent form with its own Admin sheet
 ("TMO Admin One-Off", uploaded from `TMO Admin One-Off.xlsx`) and its own
 Donations sheet ("TMO Donations One-Off") with columns
-`SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS, No Forms`.
-ADS (Supports ÷ Forms) is calculated automatically, not entered by the user.
+`SigninDT, OWNCODE, BAName, BACode, Clients, DonAmt, Supports, SOD, Event Name,
+Mode of Payment, No Production`. Supports (DonAmt ÷ 1200) is calculated
+automatically and shown live next to the DonAmt field as it's typed — it is
+not entered by the user. SOD is one of `B2B/Commercial, D2D/Resi, Events,
+Streets, Roadtrip, Telesales` (no Airport option); picking "Events" opens an
+Event Name dropdown sourced from a flat, global "Events" worksheet in the
+Admin sheet (not owner-scoped — edit that worksheet directly to add/remove
+events). Mode of Payment is `Online` or `Cheque`.
+
 It does not share any sheet with the main donation form. It has the same
 SignIn Date gate, owner passcode self-service gate, BA joinee-date tracking,
-"No Forms" (equivalent to the main form's "NO Production") checkbox, and
-Owners Data History view (with per-date Excel download) as the main RG form
-— see those sections above; the mechanics are identical, just Forms/Supports/
-Clients in place of Amount/Age/SOD. A Passcode protects an OWNCODE as a whole
-even though the same owner can appear multiple times in the Owners sheet with
-a different Client (e.g. HAI, STC) — setting it once covers every Client row.
+"NO Production" checkbox, and Owners Data History view (with per-date Excel
+download) as the main RG form — see those sections above; the mechanics are
+identical. A Passcode protects an OWNCODE as a whole even though the same
+owner can appear multiple times in the Owners sheet with a different Client
+(e.g. HAI, STC) — setting it once covers every Client row. The BAs worksheet
+also has a `Client` column (`OWNCODE, BACode, BAName, Client, New Joinee
+Date`); the BA Name dropdown only shows BAs whose Client matches the
+currently selected owner's Client, and adding a new BA through the form
+writes the currently selected Client into that BA's row.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -67,7 +77,8 @@ python setup.py                          # if you haven't already (signs in with
 python setup_oneoff.py                   # one-time: creates the Admin + Donations One-Off sheets
 python setup_oneoff_owner_passcodes.py   # one-time: adds the Passcode column to Owners
 python setup_oneoff_ba_joinee_date.py    # one-time: adds the New Joinee Date column to BAs
-python setup_oneoff_no_forms_column.py   # one-time: adds the No Forms column to Donations One-Off
+python setup_oneoff_donamt_migration.py  # one-time: DonAmt/SOD/Event Name/Mode of Payment/No Production columns
+python setup_oneoff_events.py            # one-time: adds the global Events worksheet
 python -m streamlit run app_oneoff.py
 ```
 

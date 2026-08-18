@@ -6,18 +6,23 @@ Form order:  Owner Code  →  Passcode  →  SignIn Date  →  BA Name  →  Add
 Data source: its own dedicated sheets, independent from the main donation form,
 configured via sheets_config.json (created by setup_oneoff.py):
     • Admin One-Off sheet     — worksheets "Owners" (OWNCODE|OwnerName|Client|Passcode,
-      Passcode added by setup_oneoff_owner_passcodes.py) and "BAs"
-      (OWNCODE|BACode|BAName|New Joinee Date, New Joinee Date added by
-      setup_oneoff_ba_joinee_date.py). An OWNCODE can have multiple Owners rows
-      with a different Client (e.g. HAI, STC) — each is its own selectable
-      entry; picking one sets both together. A Passcode protects the OWNCODE
-      as a whole, regardless of which Client row was picked.
+      Passcode added by setup_oneoff_owner_passcodes.py), "BAs"
+      (OWNCODE|BACode|BAName|Client|New Joinee Date, New Joinee Date added by
+      setup_oneoff_ba_joinee_date.py), and "Events" (EventName, added by
+      setup_oneoff_events.py — a flat, global list, not owner-scoped; edit that
+      worksheet directly to add/remove/rename events). An OWNCODE can have
+      multiple Owners rows with a different Client (e.g. HAI, STC) — each is
+      its own selectable entry; picking one sets both together. A Passcode
+      protects the OWNCODE as a whole, regardless of which Client row was
+      picked. The BA Name dropdown is scoped to BAs whose Client matches the
+      currently selected owner's Client.
     • Donations One-Off sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Clients, Forms, Supports, ADS, No Forms
-      (No Forms added by setup_oneoff_no_forms_column.py)
+        SigninDT, OWNCODE, BAName, BACode, Clients, DonAmt, Supports, SOD,
+        Event Name, Mode of Payment, No Production
+      (added/renamed by setup_oneoff_donamt_migration.py)
 
-ADS (Average Donation per Support) is calculated automatically as
-Supports / Forms — it is not a form input.
+Supports is calculated automatically as DonAmt / 1200 — it is not a form
+input, and is shown live next to the DonAmt field as it's typed.
 
 The first time an owner with a blank "Passcode" cell (Owners sheet) is
 picked, the form asks them to set one (typed twice to confirm) and saves it
@@ -26,7 +31,7 @@ passcode box that gates everything below it (SignIn Date onward, plus the
 Owners Data History view) until the correct passcode is entered — for the
 rest of that browser session, it isn't asked again.
 
-The "No Forms" checkbox (right after SignIn Date) is for an owner with
+The "No Production" checkbox (right after SignIn Date) is for an owner with
 nothing to report for that sign-in — it hides BA/Entries and records a
 single row with only SigninDT, OWNCODE, and Clients filled in, no preview
 step. When a brand-new BA is added through the form, the SignIn Date used
@@ -41,7 +46,8 @@ Run:
     python setup_oneoff.py                 # one-time: creates the Admin + Donations One-Off sheets + extends config
     python setup_oneoff_owner_passcodes.py # one-time: adds the Passcode column to Owners
     python setup_oneoff_ba_joinee_date.py  # one-time: adds the New Joinee Date column to BAs
-    python setup_oneoff_no_forms_column.py # one-time: adds the No Forms column to Donations One-Off
+    python setup_oneoff_donamt_migration.py# one-time: DonAmt/SOD/Event Name/Mode of Payment/No Production columns
+    python setup_oneoff_events.py          # one-time: adds the global Events worksheet
     python -m streamlit run app_oneoff.py
 """
 
@@ -67,8 +73,12 @@ SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "Forms", "Supports", "ADS", "No Forms"]
-ADS_DECIMALS = 1
+HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "DonAmt", "Supports",
+           "SOD", "Event Name", "Mode of Payment", "No Production"]
+SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Roadtrip", "Telesales"]
+MODE_OF_PAYMENT = ["Online", "Cheque"]
+SUPPORTS_DIVISOR = 1200
+SUPPORTS_DECIMALS = 2
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -204,25 +214,37 @@ def load_admin():
         else:
             passcode_by_code.setdefault(c, "")
 
-    ba_by_code, ba_codes = {}, set()
+    # BA Name options are scoped by (OWNCODE, Client) — an owner code with
+    # several Client rows (e.g. HAI, STC) only sees the BAs registered under
+    # the Client actually selected.
+    ba_by_owner_client, ba_codes = {}, set()
     for r in bas_rows:
         c = str(r.get("OWNCODE", "")).strip()
         name = str(r.get("BAName", "")).strip()
         bacode = str(r.get("BACode", "")).strip()
+        ba_client = str(r.get("Client", "")).strip()
         if not c or not name:
             continue
-        ba_by_code.setdefault(c, [])
-        if name not in [t[0] for t in ba_by_code[c]]:
-            ba_by_code[c].append((name, bacode))
+        key = (c, ba_client)
+        ba_by_owner_client.setdefault(key, [])
+        if name not in [t[0] for t in ba_by_owner_client[key]]:
+            ba_by_owner_client[key].append((name, bacode))
         if bacode:
             ba_codes.add(bacode)
-    for c in ba_by_code:
-        ba_by_code[c] = sorted(ba_by_code[c], key=lambda t: t[0].lower())
+    for key in ba_by_owner_client:
+        ba_by_owner_client[key] = sorted(ba_by_owner_client[key], key=lambda t: t[0].lower())
+
+    events_values = sh.worksheet("Events").get_all_values()
+    event_options = sorted(
+        {row[0].strip() for row in events_values[1:] if row and row[0].strip()},
+        key=str.lower,
+    ) if events_values else []
 
     return {"owner_labels": owner_labels, "label_to_owner": label_to_owner,
             "owner_count": len(owner_codes), "owner_name_by_code": owner_name_by_code,
             "passcode_by_code": passcode_by_code,
-            "ba_by_code": ba_by_code, "ba_codes": ba_codes}
+            "ba_by_owner_client": ba_by_owner_client, "ba_codes": ba_codes,
+            "event_options": event_options}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -359,7 +381,7 @@ def _update_cell_with_retry(ws, row, col, value, cache_keys, max_attempts=8):
 
 
 def append_bas(new_rows):
-    """new_rows: list of (OWNCODE, BACode, BAName, NewJoineeDate) -> appended to the BAs worksheet."""
+    """new_rows: list of (OWNCODE, BACode, BAName, Client, NewJoineeDate) -> appended to the BAs worksheet."""
     cfg = load_config()
     ws = get_ws(cfg[ADMIN_SHEET_KEY], "_ws_bas", "BAs")
     _append_with_retry(ws, [list(r) for r in new_rows], cache_keys=("_ws_bas",))
@@ -502,7 +524,7 @@ n = st.session_state.nonce
 bn = st.session_state.ba_nonce
 
 
-def parse_positive_int(raw):
+def parse_positive_amount(raw):
     text = str(raw or "").strip()
     if not text:
         return None
@@ -510,9 +532,7 @@ def parse_positive_int(raw):
         value = float(text)
     except ValueError:
         return None
-    if not value.is_integer():
-        return None
-    return int(value)
+    return value
 
 
 def fmt_number(v):
@@ -525,11 +545,15 @@ def fmt_number(v):
     return str(int(f)) if f.is_integer() else str(f)
 
 
+def compute_supports(donamt_v):
+    return round(donamt_v / SUPPORTS_DIVISOR, SUPPORTS_DECIMALS)
+
+
 def validate_edited_rows(records):
     """Re-validate rows coming back from the editable preview grid (values may
     have been typed/changed there). Returns (errors, clean_rows) — clean_rows
-    is only meaningful when errors is empty. ADS is always recomputed from
-    Forms/Supports rather than trusted from the grid, since it's derived."""
+    is only meaningful when errors is empty. Supports is always recomputed
+    from DonAmt rather than trusted from the grid, since it's derived."""
     errors, clean_rows = [], []
     for i, r in enumerate(records, start=1):
         signindt = str(r.get("SigninDT") or "").strip()
@@ -537,14 +561,16 @@ def validate_edited_rows(records):
         ban = str(r.get("BAName") or "").strip()
         bac = str(r.get("BACode") or "").strip()
         clients = str(r.get("Clients") or "").strip()
-        forms_raw, supports_raw = r.get("Forms"), r.get("Supports")
+        donamt_raw = r.get("DonAmt")
+        sod_v = str(r.get("SOD") or "").strip()
+        event_v = str(r.get("Event Name") or "").strip()
+        mop_v = str(r.get("Mode of Payment") or "").strip()
 
         # a blank row added via the grid's "+" control — skip silently
-        if not any([signindt, ownc, ban, forms_raw not in (None, ""), supports_raw not in (None, "")]):
+        if not any([signindt, ownc, ban, donamt_raw not in (None, ""), sod_v]):
             continue
 
-        forms_v = parse_positive_int(forms_raw)
-        supports_v = parse_positive_int(supports_raw)
+        donamt_v = parse_positive_amount(donamt_raw)
 
         if not signindt:
             errors.append(f"Row {i}: **SigninDT** is required.")
@@ -552,24 +578,51 @@ def validate_edited_rows(records):
             errors.append(f"Row {i}: **OWNCODE** is required.")
         if not ban:
             errors.append(f"Row {i}: **BAName** is required.")
-        if forms_v is None or forms_v <= 0:
-            errors.append(f"Row {i}: **Forms** must be a whole number greater than 0.")
-        if supports_v is None or supports_v <= 0:
-            errors.append(f"Row {i}: **Supports** must be a whole number greater than 0.")
+        if donamt_v is None or donamt_v <= 0:
+            errors.append(f"Row {i}: **DonAmt** must be a number greater than 0.")
+        if not sod_v or sod_v not in SOD_CATEGORIES:
+            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_CATEGORIES)}.")
+        elif sod_v == "Events" and not event_v:
+            errors.append(f"Row {i}: **Event Name** is required when SOD is Events.")
+        if not mop_v or mop_v not in MODE_OF_PAYMENT:
+            errors.append(f"Row {i}: **Mode of Payment** must be one of {', '.join(MODE_OF_PAYMENT)}.")
 
-        ads = str(round(supports_v / forms_v, ADS_DECIMALS)) if forms_v and supports_v else ""
+        supports_v = compute_supports(donamt_v) if donamt_v else ""
         clean_rows.append({
             "SigninDT": signindt, "OWNCODE": ownc, "BAName": ban, "BACode": bac,
-            "Clients": clients, "Forms": fmt_number(forms_raw), "Supports": fmt_number(supports_raw),
-            "ADS": ads, "No Forms": "0",
+            "Clients": clients, "DonAmt": fmt_number(donamt_raw), "Supports": fmt_number(supports_v),
+            "SOD": sod_v, "Event Name": event_v if sod_v == "Events" else "",
+            "Mode of Payment": mop_v, "No Production": "0",
         })
     return errors, clean_rows
+
+
+def sync_preview_from_grid(records):
+    """Rebuild pending_preview from the editable grid's current output so that
+    edits/deletions made there persist across reruns. Without this, deleting a
+    row only ever changed what the widget displayed — st.session_state.pending_preview
+    (the actual source of truth used to rebuild the grid on every rerun, e.g.
+    when a new entry gets appended for another BA) never learned about the
+    deletion, so the "deleted" row would silently come back. Lenient: doesn't
+    validate, just mirrors whatever is currently showing (blank filler rows
+    from the grid's own "+" control are dropped)."""
+    synced = []
+    for r in records:
+        row = {h: r.get(h, "") for h in HEADERS}
+        if not any([str(row.get("SigninDT") or "").strip(), str(row.get("OWNCODE") or "").strip(),
+                    str(row.get("BAName") or "").strip(), row.get("DonAmt") not in (None, ""),
+                    str(row.get("SOD") or "").strip()]):
+            continue
+        row["DonAmt"] = fmt_number(row["DonAmt"]) if row["DonAmt"] not in (None, "") else ""
+        row["Supports"] = fmt_number(row["Supports"]) if row["Supports"] not in (None, "") else ""
+        synced.append(row)
+    return synced
 
 
 # --------------------------------------------------------------------------- #
 #  Header
 # --------------------------------------------------------------------------- #
-total_bas = sum(len(v) for v in A["ba_by_code"].values())
+total_bas = sum(len(v) for v in A["ba_by_owner_client"].values())
 hc1, hc2 = st.columns([1, 4], vertical_alignment="center")
 if os.path.exists(LOGO_FILE):
     hc1.image(LOGO_FILE, width=130)
@@ -644,22 +697,23 @@ with st.container(key="entry_form"):
     if not signin:
         st.info("Select the **SignIn Date** above to continue.")
     else:
-        # ---- No Forms ----
-        no_forms = st.checkbox(
-            "No Forms — this owner has no forms to report for this sign-in",
-            key=f"noforms_{n}",
+        # ---- NO Production ----
+        no_production = st.checkbox(
+            "NO Production — this owner has no donations to report for this sign-in",
+            key=f"noprod_{n}",
         )
 
-        if not no_forms:
+        if not no_production:
             # ---- 3) BA Name (shows "Name · BACode"; key includes code so it resets when owner changes) ----
+            ba_key = (code, client) if code else None
             combined = {}
-            for nm_, cd_ in (A["ba_by_code"].get(code, []) if code else []):
+            for nm_, cd_ in (A["ba_by_owner_client"].get(ba_key, []) if ba_key else []):
                 combined[nm_] = cd_
-            for nm_, cd_ in (st.session_state.new_bas.get(code, []) if code else []):
+            for nm_, cd_ in (st.session_state.new_bas.get(ba_key, []) if ba_key else []):
                 combined.setdefault(nm_, cd_)
-            if code:
-                for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas:
-                    if owner_c == code:
+            if ba_key:
+                for owner_c, owner_cl, cd_, nm_, _jd_ in st.session_state.pending_new_bas:
+                    if (owner_c, owner_cl) == ba_key:
                         combined.setdefault(nm_, cd_)
             ba_pairs = sorted(combined.items(), key=lambda t: t[0].lower())
             ba_labels = [f"{nm_}  ·  {cd_}" if cd_ else nm_ for nm_, cd_ in ba_pairs]
@@ -711,19 +765,28 @@ with st.container(key="entry_form"):
                     if len(st.session_state.rows) > 1 and h[1].button("✕", key=f"rm_{rid}", help="Remove"):
                         to_remove = rid
                     d1, d2 = st.columns(2)
-                    forms = d1.text_input("Forms *", key=f"forms_{rid}", placeholder="whole number > 0")
-                    _f = (forms or "").strip()
-                    forms_v = parse_positive_int(_f) if _f else None
-                    if _f and (forms_v is None or forms_v <= 0):
-                        d1.caption(":red[⚠ Enter a whole number greater than 0]")
-                    supports = d2.text_input("Supports *", key=f"supports_{rid}", placeholder="whole number > 0")
-                    _s = (supports or "").strip()
-                    supports_v = parse_positive_int(_s) if _s else None
-                    if _s and (supports_v is None or supports_v <= 0):
-                        d2.caption(":red[⚠ Enter a whole number greater than 0]")
-                    if forms_v and forms_v > 0 and supports_v is not None and supports_v > 0:
-                        st.caption(f"ADS (Supports ÷ Forms) = **{round(supports_v / forms_v, ADS_DECIMALS)}**")
-                    row_inputs.append((idx, forms, supports))
+                    donamt = d1.text_input("DonAmt *", key=f"donamt_{rid}", placeholder="amount > 0")
+                    _d = (donamt or "").strip()
+                    donamt_v = parse_positive_amount(_d) if _d else None
+                    if _d and (donamt_v is None or donamt_v <= 0):
+                        d1.caption(":red[⚠ Enter a number greater than 0]")
+                    elif donamt_v:
+                        d1.caption(f"Supports = **{compute_supports(donamt_v)}**")
+                    sod = d2.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
+                                       placeholder="Select a source…", key=f"sod_{rid}")
+
+                    event_name = ""
+                    if sod == "Events":
+                        if not A["event_options"]:
+                            st.selectbox("Event Name *", [], index=None, disabled=True,
+                                         placeholder="No events set up yet", key=f"event_ph_{rid}")
+                        else:
+                            event_name = st.selectbox("Event Name *", A["event_options"], index=None,
+                                                      placeholder="Select an event…", key=f"event_{rid}")
+
+                    mop = st.selectbox("Mode of Payment *", MODE_OF_PAYMENT, index=None,
+                                       placeholder="Select a mode…", key=f"mop_{rid}")
+                    row_inputs.append((idx, donamt, sod, event_name, mop))
 
             if to_remove is not None:
                 st.session_state.rows.remove(to_remove)
@@ -752,9 +815,12 @@ with st.container(key="entry_form"):
                     cd = (manual_code or "").strip()
                 else:
                     cd = ""
-                existing_lower = {t[0].lower() for t in (A["ba_by_code"].get(code, []) if code else [])}
-                existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(code, []) if code else [])}
-                existing_lower |= {nm_.lower() for owner_c, cd_, nm_, _jd_ in st.session_state.pending_new_bas if owner_c == code}
+                existing_lower = {t[0].lower() for t in (A["ba_by_owner_client"].get(ba_key, []) if ba_key else [])}
+                existing_lower |= {t[0].lower() for t in (st.session_state.new_bas.get(ba_key, []) if ba_key else [])}
+                existing_lower |= {
+                    nm_.lower() for owner_c, owner_cl, cd_, nm_, _jd_ in st.session_state.pending_new_bas
+                    if (owner_c, owner_cl) == ba_key
+                }
                 is_new, effective_ba = False, ""
                 if nm:
                     effective_ba = nm
@@ -773,27 +839,31 @@ with st.container(key="entry_form"):
 
                 # validate every entry row
                 valid_rows = []
-                for idx, forms, supports in row_inputs:
-                    forms = (forms or "").strip()
-                    supports = (supports or "").strip()
-                    forms_v = parse_positive_int(forms)
-                    supports_v = parse_positive_int(supports)
+                for idx, donamt, sod, event_name, mop in row_inputs:
+                    donamt = (donamt or "").strip()
+                    donamt_v = parse_positive_amount(donamt)
 
-                    if not any([forms, supports]):
+                    if not any([donamt, sod, mop]):
                         continue
-                    if forms_v is None or forms_v <= 0:
-                        errors.append(f"Entry #{idx}: **Forms** must be a whole number greater than 0.")
-                    if supports_v is None or supports_v <= 0:
-                        errors.append(f"Entry #{idx}: **Supports** must be a whole number greater than 0.")
-                    if forms_v is not None and forms_v > 0 and supports_v is not None and supports_v > 0:
-                        ads = str(round(supports_v / forms_v, ADS_DECIMALS))
+                    if donamt_v is None or donamt_v <= 0:
+                        errors.append(f"Entry #{idx}: **DonAmt** must be a number greater than 0.")
+                    if not sod:
+                        errors.append(f"Entry #{idx}: select a **source of donation**.")
+                    elif sod == "Events" and not event_name:
+                        errors.append(f"Entry #{idx}: select an **event name**.")
+                    if not mop:
+                        errors.append(f"Entry #{idx}: select a **mode of payment**.")
+                    if (donamt_v is not None and donamt_v > 0 and sod
+                            and (sod != "Events" or event_name) and mop):
+                        supports = str(compute_supports(donamt_v))
                         valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
                                            "BAName": effective_ba, "BACode": row_code, "Clients": client or "",
-                                           "Forms": forms, "Supports": supports, "ADS": ads,
-                                           "No Forms": "0"})
+                                           "DonAmt": donamt, "Supports": supports, "SOD": sod,
+                                           "Event Name": event_name if sod == "Events" else "",
+                                           "Mode of Payment": mop, "No Production": "0"})
 
                 if not errors and not valid_rows:
-                    errors.append("Add at least one entry (Forms and Supports) before saving.")
+                    errors.append("Add at least one entry (DonAmt, SOD, mode of payment) before saving.")
 
                 if errors:
                     for e in errors:
@@ -802,18 +872,25 @@ with st.container(key="entry_form"):
                 else:
                     # accumulate validated rows into the running preview (NOT saved to Sheets yet)
                     st.session_state.pending_preview.extend(valid_rows)
-                    # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + name
+                    # stage a new BA (if any) for the Admin sheet on Submit — dedup by owner + client + name
                     if is_new and effective_ba:
-                        already = {(o, nm.lower()) for o, _c, nm, _jd in st.session_state.pending_new_bas}
-                        if (code, effective_ba.lower()) not in already:
+                        already = {
+                            (o, ocl, nm.lower()) for o, ocl, _c, nm, _jd in st.session_state.pending_new_bas
+                        }
+                        if (code, client, effective_ba.lower()) not in already:
                             st.session_state.pending_new_bas.append(
-                                (code, cd, effective_ba, signin.strftime("%Y-%m-%d"))
+                                (code, client, cd, effective_ba, signin.strftime("%Y-%m-%d"))
                             )
                     # clear for the next batch: keep owner code, sign-in date, and BA name;
                     # reset only the "add a new BA" fields and the entry rows
                     st.session_state.nonce += 1
                     st.session_state.rows = [st.session_state.next_id]
                     st.session_state.next_id += 1
+                    # pending_preview's shape just changed (rows appended) — rotate the
+                    # preview editor's widget key so Streamlit doesn't try to reapply
+                    # stale per-row edit/delete state (from the old shape) onto the new
+                    # data, which is what let a deleted row silently come back to life.
+                    st.session_state.preview_nonce += 1
                     st.rerun()
 
             # --------------------------------------------------------------------------- #
@@ -828,9 +905,8 @@ with st.container(key="entry_form"):
                 st.caption("Click any cell to fix a wrong entry, or remove a row with the 🗑 icon on the right.")
 
                 preview_df = pd.DataFrame(preview)[HEADERS].copy()
-                preview_df["Forms"] = pd.to_numeric(preview_df["Forms"], errors="coerce")
+                preview_df["DonAmt"] = pd.to_numeric(preview_df["DonAmt"], errors="coerce")
                 preview_df["Supports"] = pd.to_numeric(preview_df["Supports"], errors="coerce")
-                preview_df["ADS"] = pd.to_numeric(preview_df["ADS"], errors="coerce")
                 preview_df.insert(0, "S.No", range(1, len(preview_df) + 1))
                 edited_df = st.data_editor(
                     preview_df,
@@ -840,13 +916,19 @@ with st.container(key="entry_form"):
                     key=f"preview_editor_{st.session_state.preview_nonce}",
                     column_config={
                         "S.No": st.column_config.NumberColumn("S.No", disabled=True),
-                        "Forms": st.column_config.NumberColumn("Forms", min_value=1, step=1),
-                        "Supports": st.column_config.NumberColumn("Supports", min_value=1, step=1),
-                        "ADS": st.column_config.NumberColumn("ADS", disabled=True),
-                        "No Forms": st.column_config.TextColumn("No Forms", disabled=True),
+                        "DonAmt": st.column_config.NumberColumn("DonAmt", min_value=0.01),
+                        "Supports": st.column_config.NumberColumn("Supports", disabled=True),
+                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
+                        "Event Name": st.column_config.SelectboxColumn("Event Name", options=A["event_options"]),
+                        "Mode of Payment": st.column_config.SelectboxColumn("Mode of Payment", options=MODE_OF_PAYMENT),
+                        "No Production": st.column_config.TextColumn("No Production", disabled=True),
                     },
                 )
                 edited_records = edited_df.to_dict("records")
+                # persist the grid's current state (including any deletion) back to
+                # pending_preview immediately, so it survives the next rerun instead
+                # of being silently forgotten — see sync_preview_from_grid's docstring.
+                st.session_state.pending_preview = sync_preview_from_grid(edited_records)
                 ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
                 st.info(
                     f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
@@ -885,14 +967,16 @@ with st.container(key="entry_form"):
                             # 1) register any staged new BAs in the Admin sheet first
                             if staged_new:
                                 try:
-                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
+                                    for owner_code, owner_client, cd, effective_ba, joinee_date in staged_new:
                                         if cd and cd != "Unassigned" and cd in A["ba_codes"]:
                                             st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
-                                    append_bas([(o, cd, nm, jd) for o, cd, nm, jd in staged_new])
+                                    append_bas([(o, cd, nm, ocl, jd) for o, ocl, cd, nm, jd in staged_new])
                                     load_admin.clear()
-                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
-                                        st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
-                                    added = ", ".join(f"{nm} ({cd})" for _o, cd, nm, _jd in staged_new)
+                                    for owner_code, owner_client, cd, effective_ba, joinee_date in staged_new:
+                                        st.session_state.new_bas.setdefault((owner_code, owner_client), []).append(
+                                            (effective_ba, cd)
+                                        )
+                                    added = ", ".join(f"{nm} ({cd})" for _o, _ocl, cd, nm, _jd in staged_new)
                                     st.success(f"➕ New BA(s) added to Admin sheet: {added}")
                                 except Exception as e:  # noqa: BLE001
                                     ok_to_save = False
@@ -942,8 +1026,8 @@ with st.container(key="entry_form"):
                             st.session_state.submitting = False
         else:
             st.info(
-                "BA and Entry details are disabled while **No Forms** is checked. "
-                "Submitting will record a single entry marking no forms for this owner "
+                "BA and Entry details are disabled while **NO Production** is checked. "
+                "Submitting will record a single entry marking no production for this owner "
                 "and date — there is no preview step."
             )
             nf_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
@@ -956,18 +1040,19 @@ with st.container(key="entry_form"):
                 else:
                     st.session_state.submitting = True
                     try:
-                        no_forms_row = {
+                        no_prod_row = {
                             "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
                             "BAName": "", "BACode": "", "Clients": client or "",
-                            "Forms": "", "Supports": "", "ADS": "", "No Forms": "1",
+                            "DonAmt": "", "Supports": "", "SOD": "", "Event Name": "",
+                            "Mode of Payment": "", "No Production": "1",
                         }
                         try:
-                            before, after = append_donations([no_forms_row])
+                            before, after = append_donations([no_prod_row])
                             added = after - before
                             if added == 1:
-                                st.session_state.session_entries.append(no_forms_row)
+                                st.session_state.session_entries.append(no_prod_row)
                                 st.session_state.flash_success = (
-                                    f"✅ Submitted 1 'No Forms' entry for owner {code}."
+                                    f"✅ Submitted 1 'NO Production' entry for owner {code}."
                                 )
                                 st.session_state.nonce += 1
                                 st.rerun()

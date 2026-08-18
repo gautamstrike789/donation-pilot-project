@@ -567,6 +567,28 @@ def validate_edited_rows(records):
         })
     return errors, clean_rows
 
+
+def sync_preview_from_grid(records):
+    """Rebuild pending_preview from the editable grid's current output so that
+    edits/deletions made there persist across reruns. Without this, deleting a
+    row only ever changed what the widget displayed — st.session_state.pending_preview
+    (the actual source of truth used to rebuild the grid on every rerun, e.g.
+    when a new donation gets appended for another BA) never learned about the
+    deletion, so the "deleted" row would silently come back. Lenient: doesn't
+    validate, just mirrors whatever is currently showing (blank filler rows
+    from the grid's own "+" control are dropped)."""
+    synced = []
+    for r in records:
+        row = {h: r.get(h, "") for h in HEADERS}
+        if not any([str(row.get("SigninDT") or "").strip(), str(row.get("OWNCODE") or "").strip(),
+                    str(row.get("BAName") or "").strip(), str(row.get("SOD") or "").strip(),
+                    row.get("Amount(Amt)") not in (None, ""), row.get("Age") not in (None, "")]):
+            continue
+        row["Amount(Amt)"] = fmt_number(row["Amount(Amt)"]) if row["Amount(Amt)"] not in (None, "") else ""
+        row["Age"] = fmt_number(row["Age"]) if row["Age"] not in (None, "") else ""
+        synced.append(row)
+    return synced
+
 # --------------------------------------------------------------------------- #
 #  Header
 # --------------------------------------------------------------------------- #
@@ -847,6 +869,11 @@ with st.container(key="entry_form"):
                     st.session_state.nonce += 1
                     st.session_state.rows = [st.session_state.next_id]
                     st.session_state.next_id += 1
+                    # pending_preview's shape just changed (rows appended) — rotate the
+                    # preview editor's widget key so Streamlit doesn't try to reapply
+                    # stale per-row edit/delete state (from the old shape) onto the new
+                    # data, which is what let a deleted row silently come back to life.
+                    st.session_state.preview_nonce += 1
                     st.rerun()
 
             # --------------------------------------------------------------------------- #
@@ -880,6 +907,10 @@ with st.container(key="entry_form"):
                     },
                 )
                 edited_records = edited_df.to_dict("records")
+                # persist the grid's current state (including any deletion) back to
+                # pending_preview immediately, so it survives the next rerun instead
+                # of being silently forgotten — see sync_preview_from_grid's docstring.
+                st.session_state.pending_preview = sync_preview_from_grid(edited_records)
                 ba_count = len({(r.get("OWNCODE"), r.get("BAName")) for r in edited_records if r.get("OWNCODE")})
                 st.info(
                     f"**{len(edited_records)} entry(s)** across **{ba_count} BA(s)** — not saved yet. "
