@@ -72,20 +72,6 @@ st.set_page_config(
     layout="centered",
 )
 
-# --------------------------------------------------------------------------- #
-#  Temporary maintenance window — remove this block once the fix is deployed
-# --------------------------------------------------------------------------- #
-IST = timezone(timedelta(hours=5, minutes=30))
-MAINTENANCE_UNTIL = datetime(2026, 8, 19, 6, 24, 48, tzinfo=timezone.utc)
-if datetime.now(timezone.utc) < MAINTENANCE_UNTIL:
-    st.title("🛠️ Donation Entry — Temporarily Unavailable")
-    st.warning(
-        "We're fixing an issue with this form right now. It should be back online "
-        f"within about an hour, by **{MAINTENANCE_UNTIL.astimezone(IST).strftime('%I:%M %p IST')}**. "
-        "Thanks for your patience — please check back shortly."
-    )
-    st.stop()
-
 
 # --------------------------------------------------------------------------- #
 #  Google OAuth + Sheets connection
