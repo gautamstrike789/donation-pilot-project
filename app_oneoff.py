@@ -55,6 +55,7 @@ import json
 import os
 import pickle
 import time
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import gspread
@@ -520,8 +521,26 @@ st.session_state.setdefault("preview_nonce", 0)       # rotated whenever pending
                                                        # preview editor widget doesn't carry over stale edits
 st.session_state.setdefault("submitting", False)      # guards against a duplicate Submit click resubmitting
                                                        # the same staged rows before the first write finishes
+st.session_state.setdefault("submitting_since", None)  # when the current submit lock was taken, so a
+                                                        # stalled attempt (e.g. a hung network call that
+                                                        # never raises or returns) can't leave every later
+                                                        # click permanently stuck on "already in progress"
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
+
+# _append_with_retry's own bounded retry math tops out at roughly 5 verify
+# rounds * ~127s of 429 backoff each, plus a few seconds of sleeps between
+# rounds — call it ~11 minutes worst case. A submit lock held longer than
+# that can only mean the attempt that took it never reached its own
+# finally block (killed thread, hard network hang, etc.), not that it's
+# still legitimately working — so treat it as abandoned and let a new
+# click through instead of blocking the user forever.
+SUBMIT_LOCK_TIMEOUT = timedelta(minutes=15)
+
+
+def submit_lock_is_stale():
+    started = st.session_state.get("submitting_since")
+    return bool(started) and (datetime.now(timezone.utc) - started) > SUBMIT_LOCK_TIMEOUT
 
 
 def parse_positive_amount(raw):
@@ -953,7 +972,7 @@ with st.container(key="entry_form"):
                     if edit_errors:
                         for e in edit_errors:
                             st.error(e)
-                    elif st.session_state.get("submitting"):
+                    elif st.session_state.get("submitting") and not submit_lock_is_stale():
                         # A submission from a moment ago (e.g. a double-click, or a slow
                         # 429 retry) is still in flight for this session. Processing this
                         # click too would submit the same staged rows a second time —
@@ -961,6 +980,7 @@ with st.container(key="entry_form"):
                         st.warning("A submission is already in progress — please wait a moment.")
                     else:
                         st.session_state.submitting = True
+                        st.session_state.submitting_since = datetime.now(timezone.utc)
                         try:
                             ok_to_save = True
 
@@ -1024,6 +1044,7 @@ with st.container(key="entry_form"):
                                         )
                         finally:
                             st.session_state.submitting = False
+                            st.session_state.submitting_since = None
         else:
             st.info(
                 "BA and Entry details are disabled while **NO Production** is checked. "
@@ -1035,10 +1056,11 @@ with st.container(key="entry_form"):
             if nf_submit_clicked:
                 if not code:
                     st.error("Select a valid **owner code**.")
-                elif st.session_state.get("submitting"):
+                elif st.session_state.get("submitting") and not submit_lock_is_stale():
                     st.warning("A submission is already in progress — please wait a moment.")
                 else:
                     st.session_state.submitting = True
+                    st.session_state.submitting_since = datetime.now(timezone.utc)
                     try:
                         no_prod_row = {
                             "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
@@ -1073,6 +1095,7 @@ with st.container(key="entry_form"):
                                 )
                     finally:
                         st.session_state.submitting = False
+                        st.session_state.submitting_since = None
 
 
 with history_slot.container():
