@@ -105,11 +105,17 @@ def build_report(ws_donations, amount_col):
     return report_rows, group_num
 
 
+BAND_FILL = {"backgroundColor": {"red": 1.0, "green": 0.949, "blue": 0.800}}  # soft amber
+NO_FILL = {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}
+
+
 def write_report(sh, report_rows, group_count, amount_col_label):
     existing_titles = [ws.title for ws in sh.worksheets()]
     if REPORT_WORKSHEET in existing_titles:
         ws = sh.worksheet(REPORT_WORKSHEET)
         ws.clear()
+        # clear any earlier run's banding before laying down fresh formats
+        ws.format("A1:H10000", NO_FILL)
     else:
         ws = sh.add_worksheet(REPORT_WORKSHEET, rows=max(len(report_rows) + 10, 100), cols=8)
 
@@ -118,12 +124,29 @@ def write_report(sh, report_rows, group_count, amount_col_label):
     if not report_rows:
         ws.update([header, ["No matching groups found — nothing to review right now."]],
                   value_input_option="RAW")
+        ws.format("A1:H1", {"textFormat": {"bold": True}})
         return
 
     ws.update([header] + report_rows, value_input_option="RAW")
-    # light banding: bold header, freeze it
     ws.format("A1:H1", {"textFormat": {"bold": True}})
     ws.freeze(rows=1)
+
+    # Alternate a soft amber band per Group #, so consecutive duplicate-candidate
+    # clusters are visually separated at a glance — every other group gets a
+    # fill, the rest stay white. Sent as one batch_format call regardless of
+    # how many groups there are.
+    formats = []
+    sheet_row = 2  # row 1 is the header
+    for group_num in range(1, group_count + 1):
+        group_size = sum(1 for r in report_rows if r[0] == group_num)
+        if group_num % 2 == 0:
+            formats.append({
+                "range": f"A{sheet_row}:H{sheet_row + group_size - 1}",
+                "format": BAND_FILL,
+            })
+        sheet_row += group_size
+    if formats:
+        ws.batch_format(formats)
 
 
 def main():
