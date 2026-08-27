@@ -849,21 +849,19 @@ with st.container(key="entry_form"):
                     elif donamt_v:
                         d1.caption(f"Supports = **{compute_supports(donamt_v)}**")
 
-                    # entries after #1 get their SOD/Mode of Payment pre-filled (and locked)
-                    # from Entry #1 whenever the matching checkbox below is checked — this
-                    # must happen before the widget is created so it takes effect this render
-                    sod_locked = idx > 1 and same_sod_all
-                    mop_locked = idx > 1 and same_mop_all
-                    if sod_locked and entry1_sod:
-                        st.session_state[f"sod_{rid}"] = entry1_sod
-                    if mop_locked and entry1_mop:
-                        st.session_state[f"mop_{rid}"] = entry1_mop
+                    # entries after #1 get their SOD/Mode of Payment pre-filled from Entry #1
+                    # as a starting default (via `index=`, which Streamlit only applies the
+                    # very first time a widget's key is used) whenever the matching checkbox
+                    # is checked — the field stays fully editable afterward either way
+                    sod_default_idx = None
+                    if idx > 1 and same_sod_all and entry1_sod in SOD_CATEGORIES:
+                        sod_default_idx = SOD_CATEGORIES.index(entry1_sod)
+                    mop_default_idx = None
+                    if idx > 1 and same_mop_all and entry1_mop in MODE_OF_PAYMENT:
+                        mop_default_idx = MODE_OF_PAYMENT.index(entry1_mop)
 
-                    sod = d2.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
-                                       placeholder="Select a source…", key=f"sod_{rid}",
-                                       disabled=sod_locked)
-                    if sod_locked:
-                        d2.caption("Matches Entry #1")
+                    sod = d2.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=sod_default_idx,
+                                       placeholder="Select a source…", key=f"sod_{rid}")
 
                     event_name = ""
                     if sod == "Events":
@@ -874,11 +872,8 @@ with st.container(key="entry_form"):
                             event_name = st.selectbox("Event Name *", A["event_options"], index=None,
                                                       placeholder="Select an event…", key=f"event_{rid}")
 
-                    mop = st.selectbox("Mode of Payment *", MODE_OF_PAYMENT, index=None,
-                                       placeholder="Select a mode…", key=f"mop_{rid}",
-                                       disabled=mop_locked)
-                    if mop_locked:
-                        st.caption("Matches Entry #1")
+                    mop = st.selectbox("Mode of Payment *", MODE_OF_PAYMENT, index=mop_default_idx,
+                                       placeholder="Select a mode…", key=f"mop_{rid}")
 
                     if idx == 1:
                         sc1, sc2 = st.columns(2)
