@@ -10,7 +10,11 @@ Data source: two Google Sheets configured via sheets_config.json (created by set
       (OWNCODE|OwnerName|EventName, added by setup_events.py), and "Airports"
       (AirportName, added by setup_airports.py)
     • Donations sheet — one worksheet with columns:
-        SigninDT, OWNCODE, OwnerName, BAName, BACode, Amount(Amt), Age, SOD, Event Name, Airport Name
+        SigninDT, OWNCODE, OwnerName, BAName, BACode, Amount(Amt), Age, SOD, Event Name,
+        Airport Name, NO Production, Timestamp
+      (Timestamp added by setup_timestamp_column.py — records when each row was
+      actually received from the form, separate from SigninDT which is a date
+      the BA picks; blank for historical rows submitted before it existed)
 
 When SOD is "Events", a second dropdown offers the Event Names mapped to the
 selected owner (from the Events worksheet). When SOD is "Airport", a second
@@ -60,8 +64,10 @@ CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token.pickle"
 SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
-HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Amount(Amt)", "Age", "SOD", "Event Name", "Airport Name", "NO Production"]
+HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Amount(Amt)", "Age", "SOD",
+           "Event Name", "Airport Name", "NO Production", "Timestamp"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport", "Roadtrip"]
+IST = timezone(timedelta(hours=5, minutes=30))
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -617,6 +623,9 @@ def validate_edited_rows(records):
             "Event Name": event_v if sod_v == "Events" else "",
             "Airport Name": airport_v if sod_v == "Airport" else "",
             "NO Production": "0",
+            # set fresh here (not trusted from the grid) so it reflects the moment this
+            # row was actually validated for submission, not whenever it was first staged
+            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         })
     return errors, clean_rows
 
@@ -902,7 +911,10 @@ with st.container(key="entry_form"):
                                            "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
                                            "Amount(Amt)": amt, "Age": age, "SOD": sod,
                                            "Event Name": event_name, "Airport Name": airport_name,
-                                           "NO Production": "0"})
+                                           "NO Production": "0",
+                                           # placeholder — validate_edited_rows() sets the real
+                                           # value fresh at submit time, this is just staging
+                                           "Timestamp": ""})
 
                 if not errors and not valid_rows:
                     errors.append("Add at least one donation (amount, age, source) before saving.")
@@ -966,6 +978,7 @@ with st.container(key="entry_form"):
                         "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
                         "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=A["airport_options"]),
                         "NO Production": st.column_config.TextColumn("NO Production", disabled=True),
+                        "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
                     },
                 )
                 edited_records = edited_df.to_dict("records")
@@ -1141,6 +1154,7 @@ with st.container(key="entry_form"):
                             "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
                             "BAName": "", "BACode": "", "Amount(Amt)": "", "Age": "", "SOD": "",
                             "Event Name": "", "Airport Name": "", "NO Production": "1",
+                            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
                         }
                         try:
                             before, after = append_donations([no_prod_row])

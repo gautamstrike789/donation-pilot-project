@@ -51,7 +51,10 @@ only ever shows "BA Name · BA Code", unchanged.
 ("TMO Admin One-Off", uploaded from `TMO Admin One-Off.xlsx`) and its own
 Donations sheet ("TMO Donations One-Off") with columns
 `SigninDT, OWNCODE, OwnerName, BAName, BACode, Clients, DonAmt, Supports, SOD,
-Event Name, Mode of Payment, No Production`. Supports (DonAmt ÷ 1200) is calculated
+Event Name, Mode of Payment, No Production, Timestamp`. Timestamp records when
+the row was actually received from the form (blank for historical rows from
+before it was added) — separate from SigninDT, which is a date the BA picks.
+Supports (DonAmt ÷ 1200) is calculated
 automatically and shown live next to the DonAmt field as it's typed — it is
 not entered by the user. SOD is one of `B2B/Commercial, D2D/Resi, Events,
 Streets, Roadtrip, Telesales` (no Airport option); picking "Events" opens an
@@ -80,6 +83,7 @@ python setup_oneoff_ba_joinee_date.py    # one-time: adds the New Joinee Date co
 python setup_oneoff_donamt_migration.py  # one-time: DonAmt/SOD/Event Name/Mode of Payment/No Production columns
 python setup_oneoff_events.py            # one-time: adds the global Events worksheet
 python setup_oneoff_ownername_column.py  # one-time: adds the OwnerName column to Donations One-Off
+python setup_timestamp_column.py         # one-time: adds the Timestamp column to both Donations sheets
 python -m streamlit run app_oneoff.py
 ```
 

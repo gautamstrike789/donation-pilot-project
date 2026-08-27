@@ -18,8 +18,11 @@ configured via sheets_config.json (created by setup_oneoff.py):
       currently selected owner's Client.
     • Donations One-Off sheet — one worksheet with columns:
         SigninDT, OWNCODE, OwnerName, BAName, BACode, Clients, DonAmt, Supports,
-        SOD, Event Name, Mode of Payment, No Production
-      (OwnerName added by setup_oneoff_ownername_column.py; the rest
+        SOD, Event Name, Mode of Payment, No Production, Timestamp
+      (OwnerName added by setup_oneoff_ownername_column.py; Timestamp added by
+      setup_timestamp_column.py and records when each row was actually
+      received from the form, separate from SigninDT which is a date the BA
+      picks — blank for historical rows submitted before it existed; the rest
       added/renamed by setup_oneoff_donamt_migration.py)
 
 Supports is calculated automatically as DonAmt / 1200 — it is not a form
@@ -78,11 +81,12 @@ SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
 HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Clients", "DonAmt", "Supports",
-           "SOD", "Event Name", "Mode of Payment", "No Production"]
+           "SOD", "Event Name", "Mode of Payment", "No Production", "Timestamp"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Roadtrip", "Telesales"]
 MODE_OF_PAYMENT = ["Online", "Cheque"]
 SUPPORTS_DIVISOR = 1200
 SUPPORTS_DECIMALS = 2
+IST = timezone(timedelta(hours=5, minutes=30))
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -649,6 +653,9 @@ def validate_edited_rows(records):
             "Clients": clients, "DonAmt": fmt_number(donamt_raw), "Supports": fmt_number(supports_v),
             "SOD": sod_v, "Event Name": event_v if sod_v == "Events" else "",
             "Mode of Payment": mop_v, "No Production": "0",
+            # set fresh here (not trusted from the grid) so it reflects the moment this
+            # row was actually validated for submission, not whenever it was first staged
+            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         })
     return errors, clean_rows
 
@@ -921,7 +928,10 @@ with st.container(key="entry_form"):
                                            "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
                                            "Clients": client or "", "DonAmt": donamt, "Supports": supports,
                                            "SOD": sod, "Event Name": event_name if sod == "Events" else "",
-                                           "Mode of Payment": mop, "No Production": "0"})
+                                           "Mode of Payment": mop, "No Production": "0",
+                                           # placeholder — validate_edited_rows() sets the real
+                                           # value fresh at submit time, this is just staging
+                                           "Timestamp": ""})
 
                 if not errors and not valid_rows:
                     errors.append("Add at least one entry (DonAmt, SOD, mode of payment) before saving.")
@@ -988,6 +998,7 @@ with st.container(key="entry_form"):
                         "Event Name": st.column_config.SelectboxColumn("Event Name", options=A["event_options"]),
                         "Mode of Payment": st.column_config.SelectboxColumn("Mode of Payment", options=MODE_OF_PAYMENT),
                         "No Production": st.column_config.TextColumn("No Production", disabled=True),
+                        "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
                     },
                 )
                 edited_records = edited_df.to_dict("records")
@@ -1165,6 +1176,7 @@ with st.container(key="entry_form"):
                             "BAName": "", "BACode": "", "Clients": client or "",
                             "DonAmt": "", "Supports": "", "SOD": "", "Event Name": "",
                             "Mode of Payment": "", "No Production": "1",
+                            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
                         }
                         try:
                             before, after = append_donations([no_prod_row])
