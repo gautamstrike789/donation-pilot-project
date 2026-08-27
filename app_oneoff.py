@@ -17,9 +17,10 @@ configured via sheets_config.json (created by setup_oneoff.py):
       picked. The BA Name dropdown is scoped to BAs whose Client matches the
       currently selected owner's Client.
     • Donations One-Off sheet — one worksheet with columns:
-        SigninDT, OWNCODE, BAName, BACode, Clients, DonAmt, Supports, SOD,
-        Event Name, Mode of Payment, No Production
-      (added/renamed by setup_oneoff_donamt_migration.py)
+        SigninDT, OWNCODE, OwnerName, BAName, BACode, Clients, DonAmt, Supports,
+        SOD, Event Name, Mode of Payment, No Production
+      (OwnerName added by setup_oneoff_ownername_column.py; the rest
+      added/renamed by setup_oneoff_donamt_migration.py)
 
 Supports is calculated automatically as DonAmt / 1200 — it is not a form
 input, and is shown live next to the DonAmt field as it's typed.
@@ -48,6 +49,7 @@ Run:
     python setup_oneoff_ba_joinee_date.py  # one-time: adds the New Joinee Date column to BAs
     python setup_oneoff_donamt_migration.py# one-time: DonAmt/SOD/Event Name/Mode of Payment/No Production columns
     python setup_oneoff_events.py          # one-time: adds the global Events worksheet
+    python setup_oneoff_ownername_column.py# one-time: adds the OwnerName column to Donations One-Off
     python -m streamlit run app_oneoff.py
 """
 
@@ -74,7 +76,7 @@ SECRETS_SECTION = "google_sheets"
 SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 ADMIN_SHEET_KEY = "oneoff_admin_sheet_id"
 DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
-HEADERS = ["SigninDT", "OWNCODE", "BAName", "BACode", "Clients", "DonAmt", "Supports",
+HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Clients", "DonAmt", "Supports",
            "SOD", "Event Name", "Mode of Payment", "No Production"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Roadtrip", "Telesales"]
 MODE_OF_PAYMENT = ["Online", "Cheque"]
@@ -577,6 +579,7 @@ def validate_edited_rows(records):
     for i, r in enumerate(records, start=1):
         signindt = str(r.get("SigninDT") or "").strip()
         ownc = str(r.get("OWNCODE") or "").strip()
+        ownername = str(r.get("OwnerName") or "").strip()
         ban = str(r.get("BAName") or "").strip()
         bac = str(r.get("BACode") or "").strip()
         clients = str(r.get("Clients") or "").strip()
@@ -608,7 +611,7 @@ def validate_edited_rows(records):
 
         supports_v = compute_supports(donamt_v) if donamt_v else ""
         clean_rows.append({
-            "SigninDT": signindt, "OWNCODE": ownc, "BAName": ban, "BACode": bac,
+            "SigninDT": signindt, "OWNCODE": ownc, "OwnerName": ownername, "BAName": ban, "BACode": bac,
             "Clients": clients, "DonAmt": fmt_number(donamt_raw), "Supports": fmt_number(supports_v),
             "SOD": sod_v, "Event Name": event_v if sod_v == "Events" else "",
             "Mode of Payment": mop_v, "No Production": "0",
@@ -657,6 +660,7 @@ owner_label = st.selectbox(
     key="owner",
 )
 code, client = A["label_to_owner"].get(owner_label, (None, None)) if owner_label else (None, None)
+owner_name = A["owner_name_by_code"].get(code, "") if code else ""
 
 st.session_state.setdefault("verified_owners", set())
 
@@ -876,9 +880,9 @@ with st.container(key="entry_form"):
                             and (sod != "Events" or event_name) and mop):
                         supports = str(compute_supports(donamt_v))
                         valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
-                                           "BAName": effective_ba, "BACode": row_code, "Clients": client or "",
-                                           "DonAmt": donamt, "Supports": supports, "SOD": sod,
-                                           "Event Name": event_name if sod == "Events" else "",
+                                           "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
+                                           "Clients": client or "", "DonAmt": donamt, "Supports": supports,
+                                           "SOD": sod, "Event Name": event_name if sod == "Events" else "",
                                            "Mode of Payment": mop, "No Production": "0"})
 
                 if not errors and not valid_rows:
@@ -1063,7 +1067,7 @@ with st.container(key="entry_form"):
                     st.session_state.submitting_since = datetime.now(timezone.utc)
                     try:
                         no_prod_row = {
-                            "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
+                            "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
                             "BAName": "", "BACode": "", "Clients": client or "",
                             "DonAmt": "", "Supports": "", "SOD": "", "Event Name": "",
                             "Mode of Payment": "", "No Production": "1",

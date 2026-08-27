@@ -50,8 +50,8 @@ only ever shows "BA Name · BA Code", unchanged.
 `app_oneoff.py` is a second, fully independent form with its own Admin sheet
 ("TMO Admin One-Off", uploaded from `TMO Admin One-Off.xlsx`) and its own
 Donations sheet ("TMO Donations One-Off") with columns
-`SigninDT, OWNCODE, BAName, BACode, Clients, DonAmt, Supports, SOD, Event Name,
-Mode of Payment, No Production`. Supports (DonAmt ÷ 1200) is calculated
+`SigninDT, OWNCODE, OwnerName, BAName, BACode, Clients, DonAmt, Supports, SOD,
+Event Name, Mode of Payment, No Production`. Supports (DonAmt ÷ 1200) is calculated
 automatically and shown live next to the DonAmt field as it's typed — it is
 not entered by the user. SOD is one of `B2B/Commercial, D2D/Resi, Events,
 Streets, Roadtrip, Telesales` (no Airport option); picking "Events" opens an
@@ -79,6 +79,7 @@ python setup_oneoff_owner_passcodes.py   # one-time: adds the Passcode column to
 python setup_oneoff_ba_joinee_date.py    # one-time: adds the New Joinee Date column to BAs
 python setup_oneoff_donamt_migration.py  # one-time: DonAmt/SOD/Event Name/Mode of Payment/No Production columns
 python setup_oneoff_events.py            # one-time: adds the global Events worksheet
+python setup_oneoff_ownername_column.py  # one-time: adds the OwnerName column to Donations One-Off
 python -m streamlit run app_oneoff.py
 ```
 
