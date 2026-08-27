@@ -536,12 +536,15 @@ def fmt_number(v):
 def validate_edited_rows(records):
     """Re-validate rows coming back from the editable preview grid (values may
     have been typed/changed there). Returns (errors, clean_rows) — clean_rows
-    is only meaningful when errors is empty."""
+    is only meaningful when errors is empty. OwnerName is always recomputed
+    from OWNCODE rather than trusted from the grid, since it's derived (this
+    also guards against the grid's data_editor occasionally round-tripping a
+    blank cell as float NaN, which would otherwise land in the sheet as the
+    literal text "nan")."""
     errors, clean_rows = [], []
     for i, r in enumerate(records, start=1):
         signindt = str(r.get("SigninDT") or "").strip()
         ownc = str(r.get("OWNCODE") or "").strip()
-        ownername = str(r.get("OwnerName") or "").strip()
         ban = str(r.get("BAName") or "").strip()
         bac = str(r.get("BACode") or "").strip()
         sod_v = str(r.get("SOD") or "").strip()
@@ -576,6 +579,7 @@ def validate_edited_rows(records):
         elif sod_v == "Airport" and not airport_v:
             errors.append(f"Row {i}: **Airport Name** is required when SOD is Airport.")
 
+        ownername = A["owner_meta"].get(ownc, ("", ""))[0]
         clean_rows.append({
             "SigninDT": signindt, "OWNCODE": ownc, "OwnerName": ownername, "BAName": ban, "BACode": bac,
             "Amount(Amt)": fmt_number(amt_raw), "Age": fmt_number(age_raw), "SOD": sod_v,
@@ -604,6 +608,10 @@ def sync_preview_from_grid(records):
             continue
         row["Amount(Amt)"] = fmt_number(row["Amount(Amt)"]) if row["Amount(Amt)"] not in (None, "") else ""
         row["Age"] = fmt_number(row["Age"]) if row["Age"] not in (None, "") else ""
+        # OwnerName is derived from OWNCODE, not user-entered — re-derive it here too so a
+        # data_editor round-trip that turns a blank cell into float NaN (which would render
+        # as the literal text "nan") never gets persisted back into pending_preview.
+        row["OwnerName"] = A["owner_meta"].get(str(row.get("OWNCODE") or "").strip(), ("", ""))[0]
         synced.append(row)
     return synced
 

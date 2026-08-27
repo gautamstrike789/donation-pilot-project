@@ -573,13 +573,15 @@ def compute_supports(donamt_v):
 def validate_edited_rows(records):
     """Re-validate rows coming back from the editable preview grid (values may
     have been typed/changed there). Returns (errors, clean_rows) — clean_rows
-    is only meaningful when errors is empty. Supports is always recomputed
-    from DonAmt rather than trusted from the grid, since it's derived."""
+    is only meaningful when errors is empty. Supports and OwnerName are always
+    recomputed from DonAmt/OWNCODE rather than trusted from the grid, since
+    they're derived (OwnerName also guards against the grid's data_editor
+    occasionally round-tripping a blank cell as float NaN, which would
+    otherwise land in the sheet as the literal text "nan")."""
     errors, clean_rows = [], []
     for i, r in enumerate(records, start=1):
         signindt = str(r.get("SigninDT") or "").strip()
         ownc = str(r.get("OWNCODE") or "").strip()
-        ownername = str(r.get("OwnerName") or "").strip()
         ban = str(r.get("BAName") or "").strip()
         bac = str(r.get("BACode") or "").strip()
         clients = str(r.get("Clients") or "").strip()
@@ -610,6 +612,7 @@ def validate_edited_rows(records):
             errors.append(f"Row {i}: **Mode of Payment** must be one of {', '.join(MODE_OF_PAYMENT)}.")
 
         supports_v = compute_supports(donamt_v) if donamt_v else ""
+        ownername = A["owner_name_by_code"].get(ownc, "")
         clean_rows.append({
             "SigninDT": signindt, "OWNCODE": ownc, "OwnerName": ownername, "BAName": ban, "BACode": bac,
             "Clients": clients, "DonAmt": fmt_number(donamt_raw), "Supports": fmt_number(supports_v),
@@ -637,6 +640,10 @@ def sync_preview_from_grid(records):
             continue
         row["DonAmt"] = fmt_number(row["DonAmt"]) if row["DonAmt"] not in (None, "") else ""
         row["Supports"] = fmt_number(row["Supports"]) if row["Supports"] not in (None, "") else ""
+        # OwnerName is derived from OWNCODE, not user-entered — re-derive it here too so a
+        # data_editor round-trip that turns a blank cell into float NaN (which would render
+        # as the literal text "nan") never gets persisted back into pending_preview.
+        row["OwnerName"] = A["owner_name_by_code"].get(str(row.get("OWNCODE") or "").strip(), "")
         synced.append(row)
     return synced
 
