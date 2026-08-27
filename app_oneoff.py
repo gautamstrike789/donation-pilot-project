@@ -826,6 +826,14 @@ with st.container(key="entry_form"):
 
             row_inputs = []
             to_remove = None
+            # keyed by the same nonce that rotates whenever a fresh round of entries
+            # starts, so these two checkboxes reset to unchecked for the next BA/round
+            # without ever needing to write to an already-instantiated widget's key
+            same_sod_all = st.session_state.get(f"same_sod_all_{n}", False)
+            same_mop_all = st.session_state.get(f"same_mop_all_{n}", False)
+            first_rid = st.session_state.rows[0]
+            entry1_sod = st.session_state.get(f"sod_{first_rid}")
+            entry1_mop = st.session_state.get(f"mop_{first_rid}")
             for idx, rid in enumerate(st.session_state.rows, start=1):
                 with st.container(border=True):
                     h = st.columns([6, 1])
@@ -840,8 +848,22 @@ with st.container(key="entry_form"):
                         d1.caption(":red[⚠ Enter a number greater than 0]")
                     elif donamt_v:
                         d1.caption(f"Supports = **{compute_supports(donamt_v)}**")
+
+                    # entries after #1 get their SOD/Mode of Payment pre-filled (and locked)
+                    # from Entry #1 whenever the matching checkbox below is checked — this
+                    # must happen before the widget is created so it takes effect this render
+                    sod_locked = idx > 1 and same_sod_all
+                    mop_locked = idx > 1 and same_mop_all
+                    if sod_locked and entry1_sod:
+                        st.session_state[f"sod_{rid}"] = entry1_sod
+                    if mop_locked and entry1_mop:
+                        st.session_state[f"mop_{rid}"] = entry1_mop
+
                     sod = d2.selectbox("Source of Donation (SOD) *", SOD_CATEGORIES, index=None,
-                                       placeholder="Select a source…", key=f"sod_{rid}")
+                                       placeholder="Select a source…", key=f"sod_{rid}",
+                                       disabled=sod_locked)
+                    if sod_locked:
+                        d2.caption("Matches Entry #1")
 
                     event_name = ""
                     if sod == "Events":
@@ -853,7 +875,17 @@ with st.container(key="entry_form"):
                                                       placeholder="Select an event…", key=f"event_{rid}")
 
                     mop = st.selectbox("Mode of Payment *", MODE_OF_PAYMENT, index=None,
-                                       placeholder="Select a mode…", key=f"mop_{rid}")
+                                       placeholder="Select a mode…", key=f"mop_{rid}",
+                                       disabled=mop_locked)
+                    if mop_locked:
+                        st.caption("Matches Entry #1")
+
+                    if idx == 1:
+                        sc1, sc2 = st.columns(2)
+                        same_sod_all = sc1.checkbox("Use same SOD for all entries", key=f"same_sod_all_{n}")
+                        same_mop_all = sc2.checkbox("Use same Mode of Payment for all entries",
+                                                    key=f"same_mop_all_{n}")
+
                     row_inputs.append((idx, donamt, sod, event_name, mop))
 
             if to_remove is not None:
