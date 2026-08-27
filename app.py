@@ -42,6 +42,7 @@ import json
 import os
 import pickle
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
@@ -297,6 +298,10 @@ def _append_with_retry(ws, rows, cache_keys, max_attempts=8, max_verify_rounds=5
                                 sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
                                 st.session_state[ck] = sh.worksheet("Owners")
                                 ws = st.session_state[ck]
+                            elif ck == "_ws_submitlog":
+                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
+                                st.session_state[ck] = sh.worksheet("SubmitLog")
+                                ws = st.session_state[ck]
                     else:
                         raise
 
@@ -372,6 +377,28 @@ def set_owner_passcode(code, passcode):
             _update_cell_with_retry(ws, i, pc_idx + 1, passcode, cache_keys=("_ws_owners",))
             return
     raise ValueError(f"Owner code {code!r} not found in the Owners sheet.")
+
+
+def already_submitted(submit_id):
+    """True if this exact batch (by its random submit id, not its content)
+    was already confirmed written to the Donations sheet by an earlier
+    attempt — catches double-clicks and retries without ever treating two
+    separate, genuinely identical-looking donations as duplicates, since
+    each batch gets its own id regardless of content."""
+    cfg = load_config()
+    ws = get_ws(cfg["admin_sheet_id"], "_ws_submitlog", "SubmitLog")
+    return submit_id in ws.col_values(1)
+
+
+def log_submission(submit_id, code, row_count):
+    """Records that `submit_id` was successfully written, so a later
+    retry/double-click of the same batch can be recognized and skipped."""
+    cfg = load_config()
+    ws = get_ws(cfg["admin_sheet_id"], "_ws_submitlog", "SubmitLog")
+    _append_with_retry(
+        ws, [[submit_id, code, str(row_count), datetime.now(timezone.utc).isoformat()]],
+        cache_keys=("_ws_submitlog",),
+    )
 
 
 def append_donations(rows):
@@ -492,6 +519,10 @@ st.session_state.setdefault("submitting_since", None)  # when the current submit
                                                         # stalled attempt (e.g. a hung network call that
                                                         # never raises or returns) can't leave every later
                                                         # click permanently stuck on "already in progress"
+st.session_state.setdefault("submit_batch_id", None)   # random id for the batch currently staged for
+                                                        # submission — stable across repeat Submit clicks
+                                                        # on the same batch, so a durable check against
+                                                        # SubmitLog can tell "already written" from "new"
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
 
@@ -906,6 +937,11 @@ with st.container(key="entry_form"):
             #  Step 2: Preview + Submit button (writes to Google Sheets only on confirm)
             # --------------------------------------------------------------------------- #
             if st.session_state.pending_preview:
+                if not st.session_state.get("submit_batch_id"):
+                    # a stable id for this whole staged batch, regardless of how many
+                    # rows it has or how many times Submit gets clicked on it — see
+                    # already_submitted()'s docstring for why this is content-blind.
+                    st.session_state.submit_batch_id = uuid.uuid4().hex
                 preview = st.session_state.pending_preview
                 staged_new = st.session_state.pending_new_bas
 
@@ -951,12 +987,15 @@ with st.container(key="entry_form"):
                     st.session_state.pending_preview = []
                     st.session_state.pending_new_bas = []
                     st.session_state.preview_nonce += 1
+                    st.session_state.submit_batch_id = None
                     st.rerun()
 
                 if submit_clicked:
                     edit_errors, final_rows = validate_edited_rows(edited_records)
                     if not edit_errors and not final_rows:
                         edit_errors = ["Add at least one donation before submitting."]
+
+                    batch_id = st.session_state.submit_batch_id
 
                     if edit_errors:
                         for e in edit_errors:
@@ -971,6 +1010,32 @@ with st.container(key="entry_form"):
                         st.session_state.submitting = True
                         st.session_state.submitting_since = datetime.now(timezone.utc)
                         try:
+                            # Durable check: this exact batch (identified by its random
+                            # id, not its row content) may already have been written by
+                            # an earlier click whose success message got missed — e.g. a
+                            # slow retry that finished after the user gave up and clicked
+                            # again. If so, skip re-writing and just show success again.
+                            try:
+                                already_done = already_submitted(batch_id)
+                            except Exception:  # noqa: BLE001
+                                already_done = False  # can't confirm either way — fall through to a normal attempt
+
+                            if already_done:
+                                st.session_state.session_entries.extend(final_rows)
+                                final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
+                                st.session_state.flash_success = (
+                                    f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s)."
+                                )
+                                st.session_state.pending_preview = []
+                                st.session_state.pending_new_bas = []
+                                st.session_state.submit_batch_id = None
+                                st.session_state.nonce += 1
+                                st.session_state.ba_nonce += 1
+                                st.session_state.preview_nonce += 1
+                                st.session_state.rows = [st.session_state.next_id]
+                                st.session_state.next_id += 1
+                                st.rerun()
+
                             ok_to_save = True
 
                             # 1) register any staged new BAs in the Admin sheet first
@@ -995,11 +1060,16 @@ with st.container(key="entry_form"):
                                     before, after = append_donations(final_rows)
                                     added = after - before
                                     if added == len(final_rows):
-                                        # Confirmed: exactly what we sent landed. Only now is it
-                                        # safe to mark this submitted and clear the preview —
+                                        # Confirmed: exactly what we sent landed. Log this batch's
+                                        # id right away so a later retry of the same batch is
+                                        # recognized as already-done, then clear the preview —
                                         # otherwise a shortfall would silently vanish from the
                                         # UI while the "submitted entries" download still claimed
                                         # it was saved.
+                                        try:
+                                            log_submission(batch_id, code, len(final_rows))
+                                        except Exception:  # noqa: BLE001
+                                            pass  # logging failure shouldn't hide a successful write
                                         st.session_state.session_entries.extend(final_rows)
                                         final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
                                         st.session_state.flash_success = (
@@ -1007,6 +1077,7 @@ with st.container(key="entry_form"):
                                         )
                                         st.session_state.pending_preview = []
                                         st.session_state.pending_new_bas = []
+                                        st.session_state.submit_batch_id = None
                                         st.session_state.nonce += 1
                                         st.session_state.ba_nonce += 1
                                         st.session_state.preview_nonce += 1
@@ -1033,6 +1104,8 @@ with st.container(key="entry_form"):
                             st.session_state.submitting = False
                             st.session_state.submitting_since = None
         else:
+            if not st.session_state.get("submit_batch_id"):
+                st.session_state.submit_batch_id = uuid.uuid4().hex
             st.info(
                 "BA and Donation details are disabled while **NO Production** is checked. "
                 "Submitting will record a single entry marking no production for this owner "
@@ -1041,6 +1114,7 @@ with st.container(key="entry_form"):
             np_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
                                           key=f"np_submit_{n}")
             if np_submit_clicked:
+                batch_id = st.session_state.submit_batch_id
                 if not code:
                     st.error("Select a valid **owner code**.")
                 elif st.session_state.get("submitting") and not submit_lock_is_stale():
@@ -1049,6 +1123,19 @@ with st.container(key="entry_form"):
                     st.session_state.submitting = True
                     st.session_state.submitting_since = datetime.now(timezone.utc)
                     try:
+                        try:
+                            already_done = already_submitted(batch_id)
+                        except Exception:  # noqa: BLE001
+                            already_done = False
+
+                        if already_done:
+                            st.session_state.flash_success = (
+                                f"✅ Submitted 1 'NO Production' entry for owner {code}."
+                            )
+                            st.session_state.submit_batch_id = None
+                            st.session_state.nonce += 1
+                            st.rerun()
+
                         owner_name = A["owner_meta"].get(code, ("", ""))[0]
                         no_prod_row = {
                             "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
@@ -1059,10 +1146,15 @@ with st.container(key="entry_form"):
                             before, after = append_donations([no_prod_row])
                             added = after - before
                             if added == 1:
+                                try:
+                                    log_submission(batch_id, code, 1)
+                                except Exception:  # noqa: BLE001
+                                    pass  # logging failure shouldn't hide a successful write
                                 st.session_state.session_entries.append(no_prod_row)
                                 st.session_state.flash_success = (
                                     f"✅ Submitted 1 'NO Production' entry for owner {code}."
                                 )
+                                st.session_state.submit_batch_id = None
                                 st.session_state.nonce += 1
                                 st.rerun()
                             else:
