@@ -58,6 +58,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from openpyxl import Workbook
 
+import submit_worker
+
 LOGO_FILE = "logo.png"
 CONFIG_FILE = "sheets_config.json"
 CLIENT_SECRET = "client_secret.json"
@@ -244,92 +246,9 @@ def _get_status_code(e):
     return None
 
 
-def _append_with_retry(ws, rows, cache_keys, max_attempts=8, max_verify_rounds=5):
-    """Append rows with exponential backoff for 429 (rate limit), automatic
-    session reset for 401/403 (expired token), and — critically — a
-    verify-by-content pass after every write.
-
-    Under a real concurrent-submission stress test, ws.append_rows() was
-    observed to occasionally report success while a batch of rows never
-    actually landed in the sheet — no exception, no error, just silently
-    fewer rows than expected. (This is distinct from the earlier
-    table-detection bug on a filtered sheet, which has its own fix; this is
-    Google's API itself, under enough concurrent load, not guaranteeing
-    every "successful" append call's data is durably visible.) So after
-    writing, we re-read the sheet and check, by exact content, which of the
-    rows we sent are actually present; anything missing gets resent — and
-    only the missing ones, so a resend can never create a duplicate of a
-    row that did land."""
-    notice = st.empty()
-    try:
-        remaining = list(rows)
-        for verify_round in range(max_verify_rounds):
-            if not remaining:
-                return
-            for attempt in range(max_attempts):
-                try:
-                    ws.append_rows(remaining, value_input_option="RAW")
-                    break
-                except gspread.exceptions.APIError as e:
-                    code = _get_status_code(e)
-                    if code == 429 and attempt < max_attempts - 1:
-                        wait = 2 ** attempt  # 1, 2, 4, 8, 16, 32, 64 s
-                        notice.warning(
-                            f"High traffic detected — your data is safe and will be saved "
-                            f"in {wait} second{'s' if wait > 1 else ''}. "
-                            f"Please do not close this tab. "
-                            f"(Retry {attempt + 1} of {max_attempts - 1}, "
-                            f"max wait {2 ** (max_attempts - 1) - 1}s)"
-                        )
-                        time.sleep(wait)
-                    elif code in (401, 403) and attempt == 0:
-                        # Token expired mid-session: drop cached gc + worksheet and retry once
-                        notice.warning("Re-authenticating with Google — please wait a moment...")
-                        for k in ("gc", *cache_keys):
-                            st.session_state.pop(k, None)
-                        creds = get_credentials()
-                        st.session_state.gc = gspread.authorize(creds)
-                        cfg = load_config()
-                        # Rebuild whichever worksheet we're writing to
-                        for ck in cache_keys:
-                            if ck == "_ws_donations":
-                                sh = st.session_state.gc.open_by_key(cfg["donations_sheet_id"])
-                                st.session_state[ck] = sh.sheet1
-                                ws = st.session_state[ck]
-                            elif ck == "_ws_bas":
-                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
-                                st.session_state[ck] = sh.worksheet("BAs")
-                                ws = st.session_state[ck]
-                            elif ck == "_ws_owners":
-                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
-                                st.session_state[ck] = sh.worksheet("Owners")
-                                ws = st.session_state[ck]
-                            elif ck == "_ws_submitlog":
-                                sh = st.session_state.gc.open_by_key(cfg["admin_sheet_id"])
-                                st.session_state[ck] = sh.worksheet("SubmitLog")
-                                ws = st.session_state[ck]
-                    else:
-                        raise
-
-            time.sleep(0.5)
-            after_set = {tuple(r) for r in ws.get_all_values()}
-            remaining = [r for r in remaining if tuple(r) not in after_set]
-            if remaining and verify_round < max_verify_rounds - 1:
-                time.sleep(0.5 * (verify_round + 1))
-
-        if remaining:
-            raise RuntimeError(
-                f"{len(remaining)} of {len(rows)} row(s) could not be confirmed as "
-                "written to the sheet after several attempts."
-            )
-    finally:
-        notice.empty()
-
-
 def _update_cell_with_retry(ws, row, col, value, cache_keys, max_attempts=8):
-    """Same retry/backoff/re-auth handling as _append_with_retry, for a
-    single-cell write to an existing row (no table-detection risk here —
-    the target cell is addressed directly)."""
+    """Retry/backoff/re-auth handling for a single-cell write to an existing
+    row (no table-detection risk here — the target cell is addressed directly)."""
     notice = st.empty()
     try:
         for attempt in range(max_attempts):
@@ -363,13 +282,6 @@ def _update_cell_with_retry(ws, row, col, value, cache_keys, max_attempts=8):
         notice.empty()
 
 
-def append_bas(new_rows):
-    """new_rows: list of (OWNCODE, BACode, BAName, NewJoineeDate) -> appended to the BAs worksheet."""
-    cfg = load_config()
-    ws = get_ws(cfg["admin_sheet_id"], "_ws_bas", "BAs")
-    _append_with_retry(ws, [list(r) for r in new_rows], cache_keys=("_ws_bas",))
-
-
 def set_owner_passcode(code, passcode):
     """Writes `passcode` into the Owners sheet's Passcode column for OWNCODE `code`."""
     cfg = load_config()
@@ -383,40 +295,6 @@ def set_owner_passcode(code, passcode):
             _update_cell_with_retry(ws, i, pc_idx + 1, passcode, cache_keys=("_ws_owners",))
             return
     raise ValueError(f"Owner code {code!r} not found in the Owners sheet.")
-
-
-def already_submitted(submit_id):
-    """True if this exact batch (by its random submit id, not its content)
-    was already confirmed written to the Donations sheet by an earlier
-    attempt — catches double-clicks and retries without ever treating two
-    separate, genuinely identical-looking donations as duplicates, since
-    each batch gets its own id regardless of content."""
-    cfg = load_config()
-    ws = get_ws(cfg["admin_sheet_id"], "_ws_submitlog", "SubmitLog")
-    return submit_id in ws.col_values(1)
-
-
-def log_submission(submit_id, code, row_count):
-    """Records that `submit_id` was successfully written, so a later
-    retry/double-click of the same batch can be recognized and skipped."""
-    cfg = load_config()
-    ws = get_ws(cfg["admin_sheet_id"], "_ws_submitlog", "SubmitLog")
-    _append_with_retry(
-        ws, [[submit_id, code, str(row_count), datetime.now(timezone.utc).isoformat()]],
-        cache_keys=("_ws_submitlog",),
-    )
-
-
-def append_donations(rows):
-    """rows: list of dicts keyed by HEADERS -> appended to the Donations sheet.
-    Returns (rows_before, rows_after) read straight back from the sheet so the
-    caller can prove the write actually landed (data row count excludes header)."""
-    cfg = load_config()
-    ws = get_ws(cfg["donations_sheet_id"], "_ws_donations", 0)
-    before = max(len(ws.get_all_values()) - 1, 0)
-    _append_with_retry(ws, [[r[h] for h in HEADERS] for r in rows], cache_keys=("_ws_donations",))
-    after = max(len(ws.get_all_values()) - 1, 0)
-    return before, after
 
 
 def session_xlsx_bytes(entries):
@@ -444,6 +322,125 @@ def df_to_xlsx_bytes(df, sheet_title="Sheet1"):
 
 
 # --------------------------------------------------------------------------- #
+#  Submission — the Sheets writes run on a background thread (submit_worker),
+#  because Streamlit abandons the page's own script thread on every rerun,
+#  which used to leave "already in progress" stuck and the rows unsaved.
+# --------------------------------------------------------------------------- #
+def start_submit_job(batch_id, kind, code, rows, new_bas=()):
+    """kind: "donations" or "noprod". new_bas: staged (OWNCODE, BACode, BAName, NewJoineeDate)."""
+    cfg = load_config()
+    creds = get_credentials()
+    return submit_worker.start_job(
+        batch_id,
+        meta={"kind": kind, "code": code, "rows": rows, "new_bas": list(new_bas)},
+        target=submit_worker.run_submission,
+        bas=submit_worker.SheetRef(creds, cfg["admin_sheet_id"], "BAs"),
+        donations=submit_worker.SheetRef(creds, cfg["donations_sheet_id"]),
+        submitlog=submit_worker.SheetRef(creds, cfg["admin_sheet_id"], "SubmitLog"),
+        batch_id=batch_id,
+        code=code,
+        donation_rows=[[r[h] for h in HEADERS] for r in rows],
+        new_ba_rows=[list(r) for r in new_bas],
+    )
+
+
+def current_submit_job():
+    batch_id = st.session_state.get("submit_batch_id")
+    return submit_worker.get_job(batch_id) if batch_id else None
+
+
+def reset_submit_batch():
+    st.session_state.submit_batch_id = None
+    st.session_state.submit_batch_ts = None
+
+
+def apply_finished_submit_job():
+    """Once this session's background submission has finished, apply its
+    outcome exactly as the old inline Submit did (success → clear the
+    preview/form and show the confirmation; failure → keep everything staged
+    and show the error so Submit can be clicked again)."""
+    job = current_submit_job()
+    if job is None or submit_worker.is_running(job):
+        return
+    submit_worker.pop_job(st.session_state.submit_batch_id)
+    meta, result, err = job["meta"], job["result"], job["error"]
+
+    bas_written = (result or {}).get("bas_written") or getattr(err, "bas_written", False)
+    if bas_written:
+        load_admin.clear()
+        for owner_code, cd, effective_ba, _jd in meta["new_bas"]:
+            st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
+        # already in the Admin sheet — never append them a second time on a retry
+        st.session_state.pending_new_bas = []
+
+    if result is not None:
+        rows = meta["rows"]
+        if meta["kind"] == "noprod":
+            if not result["already"]:
+                st.session_state.session_entries.extend(rows)
+            st.session_state.flash_success = f"✅ Submitted 1 'NO Production' entry for owner {meta['code']}."
+            reset_submit_batch()
+            st.session_state.nonce += 1
+        else:
+            st.session_state.session_entries.extend(rows)
+            final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in rows})
+            st.session_state.flash_success = (
+                f"✅ Submitted {len(rows)} donation(s) across {final_ba_count} BA(s)."
+            )
+            st.session_state.pending_preview = []
+            st.session_state.pending_new_bas = []
+            reset_submit_batch()
+            st.session_state.nonce += 1
+            st.session_state.ba_nonce += 1
+            st.session_state.preview_nonce += 1
+            st.session_state.rows = [st.session_state.next_id]
+            st.session_state.next_id += 1
+        # no st.rerun() here: this runs before any widget is drawn, so the rest of
+        # this run already renders the reset form (and a rerun at this point would
+        # make Streamlit drop the Owner / SignIn Date selections)
+        return
+
+    cause = getattr(err, "cause", err)
+    if getattr(err, "stage", None) == "admin":
+        msg = f"Couldn't update Admin sheet: {cause}"
+    else:
+        msg = f"Couldn't save to Donations sheet: {cause}"
+    st.session_state.submit_error = {
+        "msg": msg,
+        "perm": getattr(err, "stage", None) != "admin" and ("403" in str(cause) or "PERMISSION_DENIED" in str(cause)),
+        "bas_added": ", ".join(f"{nm} ({cd})" for _o, cd, nm, _jd in meta["new_bas"]) if bas_written else "",
+    }
+
+
+def show_submit_error():
+    err = st.session_state.pop("submit_error", None)
+    if not err:
+        return
+    if err["bas_added"]:
+        st.success(f"➕ New BA(s) added to Admin sheet: {err['bas_added']}")
+    st.error(err["msg"])
+    if err["perm"]:
+        st.caption(
+            "**403 / permission denied** — the account the app signs in as cannot "
+            "edit that sheet. Open the Donations sheet, click **Share**, and give "
+            "**Editor** access to the right account (your Google login locally, or the "
+            "service-account email on Streamlit Cloud)."
+        )
+
+
+@st.fragment(run_every=1.5)
+def submit_progress():
+    """Polls the background submission; hands control back to a full rerun
+    (which applies the outcome) as soon as it finishes."""
+    job = current_submit_job()
+    if not submit_worker.is_running(job):
+        st.rerun()
+    st.info("⏳ Submitting… please wait and don't close this tab.")
+    if job["notice"]:
+        st.warning(job["notice"])
+
+
+# --------------------------------------------------------------------------- #
 #  Guard + load
 # --------------------------------------------------------------------------- #
 if not cloud_secrets_ready() and not os.path.exists(CONFIG_FILE):
@@ -460,11 +457,18 @@ if not cloud_secrets_ready() and not os.path.exists(TOKEN_FILE):
     )
     st.stop()
 
-try:
-    A = load_admin()
-except Exception as e:  # noqa: BLE001
-    st.error(f"Couldn't load admin data from Google Sheets: {e}")
-    st.stop()
+for _attempt in range(4):
+    try:
+        A = load_admin()
+        break
+    except Exception as e:  # noqa: BLE001
+        # a short rate-limit blip while many owners are submitting shouldn't
+        # take the whole form down — wait it out a few times first
+        if submit_worker.is_transient(e) and _attempt < 3:
+            time.sleep(2 ** _attempt)
+            continue
+        st.error(f"Couldn't load admin data from Google Sheets: {e}")
+        st.stop()
 
 # --------------------------------------------------------------------------- #
 #  Visual styling
@@ -519,32 +523,22 @@ st.session_state.setdefault("pending_new_bas", [])    # new BAs staged for the A
 st.session_state.setdefault("flash_success", None)    # confirmation message that survives the post-submit rerun
 st.session_state.setdefault("preview_nonce", 0)       # rotated whenever pending_preview resets, so the
                                                        # preview editor widget doesn't carry over stale edits
-st.session_state.setdefault("submitting", False)      # guards against a duplicate Submit click resubmitting
-                                                       # the same staged rows before the first write finishes
-st.session_state.setdefault("submitting_since", None)  # when the current submit lock was taken, so a
-                                                        # stalled attempt (e.g. a hung network call that
-                                                        # never raises or returns) can't leave every later
-                                                        # click permanently stuck on "already in progress"
 st.session_state.setdefault("submit_batch_id", None)   # random id for the batch currently staged for
                                                         # submission — stable across repeat Submit clicks
                                                         # on the same batch, so a durable check against
-                                                        # SubmitLog can tell "already written" from "new"
+                                                        # SubmitLog can tell "already written" from "new";
+                                                        # also the id of its background submit job
+st.session_state.setdefault("submit_batch_ts", None)   # Timestamp for this batch's rows, fixed at its first
+                                                        # Submit click so a retry sends identical rows and
+                                                        # the content check never writes a row twice
+
+apply_finished_submit_job()
+# True while this session's batch is being written in the background — the
+# thread's own liveness, so it can never get "stuck" the way a flag could
+submit_in_flight = submit_worker.is_running(current_submit_job())
+
 n = st.session_state.nonce
 bn = st.session_state.ba_nonce
-
-# _append_with_retry's own bounded retry math tops out at roughly 5 verify
-# rounds * ~127s of 429 backoff each, plus a few seconds of sleeps between
-# rounds — call it ~11 minutes worst case. A submit lock held longer than
-# that can only mean the attempt that took it never reached its own
-# finally block (killed thread, hard network hang, etc.), not that it's
-# still legitimately working — so treat it as abandoned and let a new
-# click through instead of blocking the user forever.
-SUBMIT_LOCK_TIMEOUT = timedelta(minutes=15)
-
-
-def submit_lock_is_stale():
-    started = st.session_state.get("submitting_since")
-    return bool(started) and (datetime.now(timezone.utc) - started) > SUBMIT_LOCK_TIMEOUT
 
 
 def parse_age_value(raw_age):
@@ -570,7 +564,7 @@ def fmt_number(v):
     return str(int(f)) if f.is_integer() else str(f)
 
 
-def validate_edited_rows(records):
+def validate_edited_rows(records, timestamp):
     """Re-validate rows coming back from the editable preview grid (values may
     have been typed/changed there). Returns (errors, clean_rows) — clean_rows
     is only meaningful when errors is empty. OwnerName is always recomputed
@@ -623,9 +617,9 @@ def validate_edited_rows(records):
             "Event Name": event_v if sod_v == "Events" else "",
             "Airport Name": airport_v if sod_v == "Airport" else "",
             "NO Production": "0",
-            # set fresh here (not trusted from the grid) so it reflects the moment this
-            # row was actually validated for submission, not whenever it was first staged
-            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            # set here (not trusted from the grid) to when Submit was clicked for this
+            # batch, not whenever the row was first staged
+            "Timestamp": timestamp,
         })
     return errors, clean_rows
 
@@ -844,7 +838,10 @@ with st.container(key="entry_form"):
                 st.session_state.rows.append(st.session_state.next_id)
                 st.session_state.next_id += 1
                 st.rerun()
-            save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True)
+            # disabled only while a submit is being written, so rows added now can't
+            # be swept away when that submit finishes and clears the preview
+            save_clicked = cs.button("💾 Save all entries", type="primary", use_container_width=True,
+                                     disabled=submit_in_flight)
 
             # --------------------------------------------------------------------------- #
             #  Step 1: Validate + show preview (does NOT write to Google Sheets yet)
@@ -951,8 +948,8 @@ with st.container(key="entry_form"):
             if st.session_state.pending_preview:
                 if not st.session_state.get("submit_batch_id"):
                     # a stable id for this whole staged batch, regardless of how many
-                    # rows it has or how many times Submit gets clicked on it — see
-                    # already_submitted()'s docstring for why this is content-blind.
+                    # rows it has or how many times Submit gets clicked on it — the
+                    # SubmitLog check is keyed on it, so it's content-blind.
                     st.session_state.submit_batch_id = uuid.uuid4().hex
                 preview = st.session_state.pending_preview
                 staged_new = st.session_state.pending_new_bas
@@ -970,6 +967,7 @@ with st.container(key="entry_form"):
                     use_container_width=True,
                     hide_index=True,
                     num_rows="dynamic",
+                    disabled=submit_in_flight,
                     key=f"preview_editor_{st.session_state.preview_nonce}",
                     column_config={
                         "S.No": st.column_config.NumberColumn("S.No", disabled=True),
@@ -993,129 +991,44 @@ with st.container(key="entry_form"):
                 )
 
                 pc1, pc2 = st.columns(2)
-                submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True)
-                cancel_clicked = pc2.button("✕ Cancel", use_container_width=True)
+                submit_clicked = pc1.button("✅ Submit", type="primary", use_container_width=True,
+                                            disabled=submit_in_flight)
+                cancel_clicked = pc2.button("✕ Cancel", use_container_width=True, disabled=submit_in_flight)
+                if submit_in_flight:
+                    submit_progress()
+                show_submit_error()
 
                 if cancel_clicked:
                     st.session_state.pending_preview = []
                     st.session_state.pending_new_bas = []
                     st.session_state.preview_nonce += 1
-                    st.session_state.submit_batch_id = None
+                    reset_submit_batch()
                     st.rerun()
 
                 if submit_clicked:
-                    edit_errors, final_rows = validate_edited_rows(edited_records)
+                    if not st.session_state.submit_batch_ts:
+                        st.session_state.submit_batch_ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                    edit_errors, final_rows = validate_edited_rows(edited_records, st.session_state.submit_batch_ts)
                     if not edit_errors and not final_rows:
                         edit_errors = ["Add at least one donation before submitting."]
-
-                    batch_id = st.session_state.submit_batch_id
 
                     if edit_errors:
                         for e in edit_errors:
                             st.error(e)
-                    elif st.session_state.get("submitting") and not submit_lock_is_stale():
-                        # A submission from a moment ago (e.g. a double-click, or a slow
-                        # 429 retry) is still in flight for this session. Processing this
-                        # click too would submit the same staged rows a second time —
-                        # skip instead of resubmitting.
+                    elif submit_worker.is_running(current_submit_job()):
+                        # this batch is still being written from an earlier click —
+                        # it carries on in the background; never start it twice
                         st.warning("A submission is already in progress — please wait a moment.")
                     else:
-                        st.session_state.submitting = True
-                        st.session_state.submitting_since = datetime.now(timezone.utc)
-                        try:
-                            # Durable check: this exact batch (identified by its random
-                            # id, not its row content) may already have been written by
-                            # an earlier click whose success message got missed — e.g. a
-                            # slow retry that finished after the user gave up and clicked
-                            # again. If so, skip re-writing and just show success again.
-                            try:
-                                already_done = already_submitted(batch_id)
-                            except Exception:  # noqa: BLE001
-                                already_done = False  # can't confirm either way — fall through to a normal attempt
-
-                            if already_done:
-                                st.session_state.session_entries.extend(final_rows)
-                                final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
-                                st.session_state.flash_success = (
-                                    f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s)."
-                                )
-                                st.session_state.pending_preview = []
-                                st.session_state.pending_new_bas = []
-                                st.session_state.submit_batch_id = None
-                                st.session_state.nonce += 1
-                                st.session_state.ba_nonce += 1
-                                st.session_state.preview_nonce += 1
-                                st.session_state.rows = [st.session_state.next_id]
-                                st.session_state.next_id += 1
-                                st.rerun()
-
-                            ok_to_save = True
-
-                            # 1) register any staged new BAs in the Admin sheet first
-                            if staged_new:
-                                try:
-                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
-                                        if cd and cd != "Unassigned" and cd in A["ba_codes"]:
-                                            st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
-                                    append_bas([(o, cd, nm, jd) for o, cd, nm, jd in staged_new])
-                                    load_admin.clear()
-                                    for owner_code, cd, effective_ba, joinee_date in staged_new:
-                                        st.session_state.new_bas.setdefault(owner_code, []).append((effective_ba, cd))
-                                    added = ", ".join(f"{nm} ({cd})" for _o, cd, nm, _jd in staged_new)
-                                    st.success(f"➕ New BA(s) added to Admin sheet: {added}")
-                                except Exception as e:  # noqa: BLE001
-                                    ok_to_save = False
-                                    st.error(f"Couldn't update Admin sheet: {e}")
-
-                            # 2) write all donations
-                            if ok_to_save:
-                                try:
-                                    before, after = append_donations(final_rows)
-                                    added = after - before
-                                    if added == len(final_rows):
-                                        # Confirmed: exactly what we sent landed. Log this batch's
-                                        # id right away so a later retry of the same batch is
-                                        # recognized as already-done, then clear the preview —
-                                        # otherwise a shortfall would silently vanish from the
-                                        # UI while the "submitted entries" download still claimed
-                                        # it was saved.
-                                        try:
-                                            log_submission(batch_id, code, len(final_rows))
-                                        except Exception:  # noqa: BLE001
-                                            pass  # logging failure shouldn't hide a successful write
-                                        st.session_state.session_entries.extend(final_rows)
-                                        final_ba_count = len({(r["OWNCODE"], r["BAName"]) for r in final_rows})
-                                        st.session_state.flash_success = (
-                                            f"✅ Submitted {len(final_rows)} donation(s) across {final_ba_count} BA(s)."
-                                        )
-                                        st.session_state.pending_preview = []
-                                        st.session_state.pending_new_bas = []
-                                        st.session_state.submit_batch_id = None
-                                        st.session_state.nonce += 1
-                                        st.session_state.ba_nonce += 1
-                                        st.session_state.preview_nonce += 1
-                                        st.session_state.rows = [st.session_state.next_id]
-                                        st.session_state.next_id += 1
-                                        st.rerun()
-                                    else:
-                                        st.error(
-                                            f"Expected to add {len(final_rows)} row(s) but the sheet's row "
-                                            f"count only increased by {added}. Nothing has been cleared from "
-                                            "your preview — check the Donations sheet before retrying, and "
-                                            "contact the admin if you're unsure."
-                                        )
-                                except Exception as e:  # noqa: BLE001
-                                    st.error(f"Couldn't save to Donations sheet: {e}")
-                                    if "403" in str(e) or "PERMISSION_DENIED" in str(e):
-                                        st.caption(
-                                            "**403 / permission denied** — the account the app signs in as cannot "
-                                            "edit that sheet. Open the Donations sheet, click **Share**, and give "
-                                            "**Editor** access to the right account (your Google login locally, or the "
-                                            "service-account email on Streamlit Cloud)."
-                                        )
-                        finally:
-                            st.session_state.submitting = False
-                            st.session_state.submitting_since = None
+                        for owner_code, cd, effective_ba, joinee_date in staged_new:
+                            if cd and cd != "Unassigned" and cd in A["ba_codes"]:
+                                st.warning(f"BA code **{cd}** already exists in the Admin sheet; saving anyway.")
+                        # The writes (SubmitLog check → new BAs → donations → log) run on a
+                        # background thread that a Streamlit rerun can't abort; the page
+                        # shows progress and applies the outcome once it's done.
+                        start_submit_job(st.session_state.submit_batch_id, "donations", code, final_rows,
+                                         new_bas=staged_new)
+                        st.rerun()
         else:
             if not st.session_state.get("submit_batch_id"):
                 st.session_state.submit_batch_id = uuid.uuid4().hex
@@ -1125,70 +1038,27 @@ with st.container(key="entry_form"):
                 "and date — there is no preview step."
             )
             np_submit_clicked = st.button("✅ Submit", type="primary", use_container_width=True,
-                                          key=f"np_submit_{n}")
+                                          key=f"np_submit_{n}", disabled=submit_in_flight)
+            if submit_in_flight:
+                submit_progress()
+            show_submit_error()
             if np_submit_clicked:
-                batch_id = st.session_state.submit_batch_id
                 if not code:
                     st.error("Select a valid **owner code**.")
-                elif st.session_state.get("submitting") and not submit_lock_is_stale():
+                elif submit_worker.is_running(current_submit_job()):
                     st.warning("A submission is already in progress — please wait a moment.")
                 else:
-                    st.session_state.submitting = True
-                    st.session_state.submitting_since = datetime.now(timezone.utc)
-                    try:
-                        try:
-                            already_done = already_submitted(batch_id)
-                        except Exception:  # noqa: BLE001
-                            already_done = False
-
-                        if already_done:
-                            st.session_state.flash_success = (
-                                f"✅ Submitted 1 'NO Production' entry for owner {code}."
-                            )
-                            st.session_state.submit_batch_id = None
-                            st.session_state.nonce += 1
-                            st.rerun()
-
-                        owner_name = A["owner_meta"].get(code, ("", ""))[0]
-                        no_prod_row = {
-                            "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
-                            "BAName": "", "BACode": "", "Amount(Amt)": "", "Age": "", "SOD": "",
-                            "Event Name": "", "Airport Name": "", "NO Production": "1",
-                            "Timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                        try:
-                            before, after = append_donations([no_prod_row])
-                            added = after - before
-                            if added == 1:
-                                try:
-                                    log_submission(batch_id, code, 1)
-                                except Exception:  # noqa: BLE001
-                                    pass  # logging failure shouldn't hide a successful write
-                                st.session_state.session_entries.append(no_prod_row)
-                                st.session_state.flash_success = (
-                                    f"✅ Submitted 1 'NO Production' entry for owner {code}."
-                                )
-                                st.session_state.submit_batch_id = None
-                                st.session_state.nonce += 1
-                                st.rerun()
-                            else:
-                                st.error(
-                                    "Expected to add 1 row but the sheet's row count didn't increase by 1. "
-                                    "Nothing has been recorded as submitted — check the Donations sheet "
-                                    "before retrying, and contact the admin if you're unsure."
-                                )
-                        except Exception as e:  # noqa: BLE001
-                            st.error(f"Couldn't save to Donations sheet: {e}")
-                            if "403" in str(e) or "PERMISSION_DENIED" in str(e):
-                                st.caption(
-                                    "**403 / permission denied** — the account the app signs in as cannot "
-                                    "edit that sheet. Open the Donations sheet, click **Share**, and give "
-                                    "**Editor** access to the right account (your Google login locally, or the "
-                                    "service-account email on Streamlit Cloud)."
-                                )
-                    finally:
-                        st.session_state.submitting = False
-                        st.session_state.submitting_since = None
+                    if not st.session_state.submit_batch_ts:
+                        st.session_state.submit_batch_ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                    owner_name = A["owner_meta"].get(code, ("", ""))[0]
+                    no_prod_row = {
+                        "SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code, "OwnerName": owner_name,
+                        "BAName": "", "BACode": "", "Amount(Amt)": "", "Age": "", "SOD": "",
+                        "Event Name": "", "Airport Name": "", "NO Production": "1",
+                        "Timestamp": st.session_state.submit_batch_ts,
+                    }
+                    start_submit_job(st.session_state.submit_batch_id, "noprod", code, [no_prod_row])
+                    st.rerun()
 
 
 with history_slot.container():
