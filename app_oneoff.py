@@ -358,6 +358,97 @@ def df_to_xlsx_bytes(df, sheet_title="Sheet1"):
 
 
 # --------------------------------------------------------------------------- #
+#  Weekly summary — the owner's total forms + supports per day, Tuesday → Monday
+# --------------------------------------------------------------------------- #
+WEEK_DAYS = ["Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Monday"]
+NO_PRODUCTION_CELL = "No Production"
+NO_DATA_CELL = "No data found"
+
+
+def week_ending(d):
+    """Weeks run Tuesday → Monday; the week-ending (WE) date is that Monday."""
+    return d + timedelta(days=-d.weekday() % 7)
+
+
+SUMMARY_TABLE_CSS = """
+<style>
+  .we-summary-wrap { overflow-x:auto; margin:.25rem 0 1rem; }
+  .we-summary { width:100%; min-width:560px; table-layout:fixed; border-collapse:separate;
+    border-spacing:0; border:1px solid #e4e9f6; border-radius:12px; overflow:hidden;
+    background:#fff; font-size:.9rem; }
+  .we-summary th, .we-summary td { padding:.5rem .35rem; text-align:center;
+    border-bottom:1px solid #eef1f8; word-wrap:break-word; }
+  .we-summary th { background:#eef2fb; color:#41496b; font-weight:600; }
+  .we-summary th span { display:block; font-weight:400; font-size:.78rem; color:#6b7390; }
+  .we-summary tr:last-child td { border-bottom:none; }
+  .we-summary td.lbl { color:#41496b; font-weight:600; text-align:left; }
+  .we-summary td.val { color:#1f2a5a; font-weight:700; }
+  .we-summary td.np { color:#d93025; font-weight:700; }
+  .we-summary td.nd { color:#8a8fa3; font-size:.82rem; }
+</style>
+"""
+
+
+def summary_table_html(cells, row_label):
+    """cells: [(day name, "22 Sep", value)] → a 7-day table that fits the page
+    width (and scrolls sideways on a phone). No Production is shown in red."""
+    head = "".join(f"<th>{day}<span>{dt}</span></th>" for day, dt, _ in cells)
+    body = "".join(
+        f'<td class="{"np" if v == NO_PRODUCTION_CELL else "nd" if v == NO_DATA_CELL else "val"}">{v}</td>'
+        for _day, _dt, v in cells
+    )
+    return (f'{SUMMARY_TABLE_CSS}<div class="we-summary-wrap"><table class="we-summary">'
+            f'<tr><th></th>{head}</tr><tr><td class="lbl">{row_label}</td>{body}</tr></table></div>')
+
+
+def render_weekly_summary(code):
+    """WE date + one row of the owner's totals (all BAs combined) for each
+    day of the chosen week, as "<forms>f/<supports>s", defaulting to the
+    current week."""
+    try:
+        hist = load_donations_df()
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"Couldn't load the weekly summary: {e}")
+        return
+    rows = hist[hist["OWNCODE"].astype(str).str.strip() == code].copy()
+    rows["_date"] = pd.to_datetime(rows["SigninDT"].astype(str).str.strip(), errors="coerce").dt.date
+    rows = rows.dropna(subset=["_date"])
+    no_prod_col = rows["No Production"] if "No Production" in rows else pd.Series("", index=rows.index)
+    rows["_no_prod"] = no_prod_col.astype(str).str.strip() == "1"
+    # Supports as saved; fall back to DonAmt / 1200 for any row where it's blank
+    supports = pd.to_numeric(rows["Supports"], errors="coerce") if "Supports" in rows else None
+    donamt = pd.to_numeric(rows["DonAmt"], errors="coerce") if "DonAmt" in rows else None
+    if supports is None:
+        supports = donamt / SUPPORTS_DIVISOR if donamt is not None else pd.Series(0.0, index=rows.index)
+    elif donamt is not None:
+        supports = supports.fillna(donamt / SUPPORTS_DIVISOR)
+    rows["_supports"] = supports.fillna(0.0)
+
+    current_we = week_ending(datetime.now(IST).date())
+    we_options = sorted({current_we, *(week_ending(d) for d in rows["_date"])}, reverse=True)
+
+    wc1, wc2 = st.columns([2, 1], vertical_alignment="bottom")
+    we = wc2.selectbox("Week ending", we_options, index=we_options.index(current_we),
+                       format_func=lambda d: d.strftime("%d %b %Y"), key=f"we_sel_{code}")
+    wc1.markdown(f"#### WE date: {we.strftime('%d %b %Y')}")
+
+    cells = []
+    for i, day_name in enumerate(WEEK_DAYS):
+        day = we - timedelta(days=6 - i)
+        on_day = rows[rows["_date"] == day]
+        form_rows = on_day[~on_day["_no_prod"]]
+        if len(form_rows):
+            value = f"{len(form_rows)}f/{round(form_rows['_supports'].sum(), SUPPORTS_DECIMALS):g}s"
+        elif on_day["_no_prod"].any():
+            value = NO_PRODUCTION_CELL
+        else:
+            value = NO_DATA_CELL
+        cells.append((day_name, day.strftime("%d %b"), value))
+
+    st.markdown(summary_table_html(cells, "Forms / Supports"), unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------- #
 #  Submission — the Sheets writes run on a background thread (submit_worker),
 #  because Streamlit abandons the page's own script thread on every rerun,
 #  which used to leave "already in progress" stuck and the rows unsaved.
@@ -1116,6 +1207,7 @@ with history_slot.container():
     st.session_state.setdefault("show_owner_history", False)
 
     if code and passcode_ok:
+        render_weekly_summary(code)
         if st.session_state.show_owner_history:
             if st.button("← Back to form"):
                 st.session_state.show_owner_history = False
