@@ -373,38 +373,53 @@ def week_ending(d):
 SUMMARY_TABLE_CSS = """
 <style>
   .we-summary-wrap { overflow-x:auto; margin:.25rem 0 1rem; }
-  .we-summary { width:100%; min-width:560px; table-layout:fixed; border-collapse:separate;
+  .we-summary { width:100%; min-width:620px; table-layout:fixed; border-collapse:separate;
     border-spacing:0; border:1px solid #e4e9f6; border-radius:12px; overflow:hidden;
     background:#fff; font-size:.9rem; }
   .we-summary th, .we-summary td { padding:.5rem .35rem; text-align:center;
     border-bottom:1px solid #eef1f8; word-wrap:break-word; }
-  .we-summary th { background:#eef2fb; color:#41496b; font-weight:600; }
+  .we-summary th { background:#eef2fb; color:#41496b; font-weight:600; font-size:.84rem;
+    overflow-wrap:normal; word-wrap:normal; }
+  .we-summary th.lblh { width:11%; }
   .we-summary th span { display:block; font-weight:400; font-size:.78rem; color:#6b7390; }
   .we-summary tr:last-child td { border-bottom:none; }
   .we-summary td.lbl { color:#41496b; font-weight:600; text-align:left; }
   .we-summary td.val { color:#1f2a5a; font-weight:700; }
   .we-summary td.np { color:#d93025; font-weight:700; }
   .we-summary td.nd { color:#8a8fa3; font-size:.82rem; }
+  .we-summary th.tot { background:#dfe6f7; color:#1f2a5a; }
+  .we-summary td.tot { background:#f3f6fd; color:#1f2a5a; font-weight:800; }
+  .month-total { display:flex; align-items:baseline; gap:.6rem; margin:.25rem 0 1rem;
+    padding:.8rem 1rem; background:#fff; border:1px solid #e4e9f6; border-radius:12px; }
+  .month-total b { font-size:1.6rem; color:#1f2a5a; }
+  .month-total span { color:#6b7390; }
 </style>
 """
 
 
-def summary_table_html(cells, row_label):
-    """cells: [(day name, "22 Sep", value)] → a 7-day table that fits the page
-    width (and scrolls sideways on a phone). No Production is shown in red."""
+def summary_table_html(cells, row_label, total):
+    """cells: [(day name, "22 Sep", value)] + the week's total → a table that
+    fits the page width (and scrolls sideways on a phone). No Production is
+    shown in red."""
     head = "".join(f"<th>{day}<span>{dt}</span></th>" for day, dt, _ in cells)
     body = "".join(
         f'<td class="{"np" if v == NO_PRODUCTION_CELL else "nd" if v == NO_DATA_CELL else "val"}">{v}</td>'
         for _day, _dt, v in cells
     )
     return (f'{SUMMARY_TABLE_CSS}<div class="we-summary-wrap"><table class="we-summary">'
-            f'<tr><th></th>{head}</tr><tr><td class="lbl">{row_label}</td>{body}</tr></table></div>')
+            f'<tr><th class="lblh"></th>{head}<th class="tot">Total<span>Week</span></th></tr>'
+            f'<tr><td class="lbl">{row_label}</td>{body}<td class="tot">{total}</td></tr></table></div>')
+
+
+def forms_value(form_rows):
+    return f"{len(form_rows)}f/{round(form_rows['_supports'].sum(), SUPPORTS_DECIMALS):g}s"
 
 
 def render_weekly_summary(code):
     """WE date + one row of the owner's totals (all BAs combined) for each
-    day of the chosen week, as "<forms>f/<supports>s", defaulting to the
-    current week."""
+    day of the chosen week and the week as a whole, as
+    "<forms>f/<supports>s", defaulting to the current week; then the owner's
+    totals for a chosen month."""
     try:
         hist = load_donations_df()
     except Exception as e:  # noqa: BLE001
@@ -423,8 +438,11 @@ def render_weekly_summary(code):
     elif donamt is not None:
         supports = supports.fillna(donamt / SUPPORTS_DIVISOR)
     rows["_supports"] = supports.fillna(0.0)
+    form_rows_all = rows[~rows["_no_prod"]]
+    today = datetime.now(IST).date()
 
-    current_we = week_ending(datetime.now(IST).date())
+    # ---- week ----
+    current_we = week_ending(today)
     we_options = sorted({current_we, *(week_ending(d) for d in rows["_date"])}, reverse=True)
 
     wc1, wc2 = st.columns([2, 1], vertical_alignment="bottom")
@@ -438,14 +456,32 @@ def render_weekly_summary(code):
         on_day = rows[rows["_date"] == day]
         form_rows = on_day[~on_day["_no_prod"]]
         if len(form_rows):
-            value = f"{len(form_rows)}f/{round(form_rows['_supports'].sum(), SUPPORTS_DECIMALS):g}s"
+            value = forms_value(form_rows)
         elif on_day["_no_prod"].any():
             value = NO_PRODUCTION_CELL
         else:
             value = NO_DATA_CELL
         cells.append((day_name, day.strftime("%d %b"), value))
+    week_rows = form_rows_all[(form_rows_all["_date"] > we - timedelta(days=7)) & (form_rows_all["_date"] <= we)]
 
-    st.markdown(summary_table_html(cells, "Forms / Supports"), unsafe_allow_html=True)
+    st.markdown(summary_table_html(cells, "Forms / Supports", forms_value(week_rows)), unsafe_allow_html=True)
+
+    # ---- month (calendar month of the SignIn Date) ----
+    current_month = (today.year, today.month)
+    month_options = sorted({current_month, *((d.year, d.month) for d in rows["_date"])}, reverse=True)
+
+    mc1, mc2 = st.columns([2, 1], vertical_alignment="bottom")
+    ym = mc2.selectbox("Month", month_options, index=month_options.index(current_month),
+                       format_func=lambda m: datetime(m[0], m[1], 1).strftime("%B %Y"), key=f"month_sel_{code}")
+    month_name = datetime(ym[0], ym[1], 1).strftime("%B %Y")
+    mc1.markdown(f"#### Monthly total: {month_name}")
+    in_month = [(d.year, d.month) == ym for d in form_rows_all["_date"]]
+    month_rows = form_rows_all[pd.Series(in_month, index=form_rows_all.index, dtype=bool)]
+    st.markdown(
+        f'<div class="month-total"><b>{forms_value(month_rows)}</b>'
+        f'<span>total forms / supports submitted in {month_name}</span></div>',
+        unsafe_allow_html=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
