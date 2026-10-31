@@ -72,6 +72,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from openpyxl import Workbook
 
+import ui_theme
 import submit_worker
 
 LOGO_FILE = "logo.png"
@@ -374,33 +375,6 @@ def week_ending(d):
     return d + timedelta(days=-d.weekday() % 7)
 
 
-SUMMARY_TABLE_CSS = """
-<style>
-  .we-summary-wrap { overflow-x:auto; margin:.25rem 0 1rem; }
-  .we-summary { width:100%; min-width:620px; table-layout:fixed; border-collapse:separate;
-    border-spacing:0; border:1px solid #e4e9f6; border-radius:12px; overflow:hidden;
-    background:#fff; font-size:.9rem; }
-  .we-summary th, .we-summary td { padding:.5rem .35rem; text-align:center;
-    border-bottom:1px solid #eef1f8; word-wrap:break-word; }
-  .we-summary th { background:#eef2fb; color:#41496b; font-weight:600; font-size:.84rem;
-    overflow-wrap:normal; word-wrap:normal; }
-  .we-summary th.lblh { width:11%; }
-  .we-summary th span { display:block; font-weight:400; font-size:.78rem; color:#6b7390; }
-  .we-summary tr:last-child td { border-bottom:none; }
-  .we-summary td.lbl { color:#41496b; font-weight:600; text-align:left; }
-  .we-summary td.val { color:#1f2a5a; font-weight:700; }
-  .we-summary td.np { color:#d93025; font-weight:700; }
-  .we-summary td.nd { color:#8a8fa3; font-size:.82rem; }
-  .we-summary th.tot { background:#dfe6f7; color:#1f2a5a; }
-  .we-summary td.tot { background:#f3f6fd; color:#1f2a5a; font-weight:800; }
-  .month-total { display:flex; align-items:baseline; gap:.6rem; margin:.25rem 0 1rem;
-    padding:.8rem 1rem; background:#fff; border:1px solid #e4e9f6; border-radius:12px; }
-  .month-total b { font-size:1.6rem; color:#1f2a5a; }
-  .month-total span { color:#6b7390; }
-</style>
-"""
-
-
 def summary_table_html(cells, row_label, total):
     """cells: [(day name, "22 Sep", value)] + the week's total → a table that
     fits the page width (and scrolls sideways on a phone). No Production is
@@ -410,7 +384,7 @@ def summary_table_html(cells, row_label, total):
         f'<td class="{"np" if v == NO_PRODUCTION_CELL else "nd" if v == NO_DATA_CELL else "val"}">{v}</td>'
         for _day, _dt, v in cells
     )
-    return (f'{SUMMARY_TABLE_CSS}<div class="we-summary-wrap"><table class="we-summary">'
+    return (f'<div class="we-summary-wrap"><table class="we-summary">'
             f'<tr><th class="lblh"></th>{head}<th class="tot">Total<span>Week</span></th></tr>'
             f'<tr><td class="lbl">{row_label}</td>{body}<td class="tot">{total}</td></tr></table></div>')
 
@@ -603,9 +577,7 @@ def submit_progress():
     job = current_submit_job()
     if not submit_worker.is_running(job):
         st.rerun()
-    st.info("⏳ Submitting… please wait and don't close this tab.")
-    if job["notice"]:
-        st.warning(job["notice"])
+    st.markdown(ui_theme.progress_html(job["notice"]), unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -641,41 +613,8 @@ for _attempt in range(4):
 # --------------------------------------------------------------------------- #
 #  Visual styling
 # --------------------------------------------------------------------------- #
-st.markdown(
-    """
-    <style>
-      @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&display=swap');
-      .stApp { background: linear-gradient(180deg,#f7f9fd 0%, #eaeefb 100%); }
-      [data-testid="stHeader"] { background: transparent; }
-      .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 780px; }
-      h1, h2, h3 { font-family: 'Poppins','Segoe UI',sans-serif !important; color:#1f2a5a; letter-spacing:-.01em; }
-      h1 { font-weight:700 !important; }
-      [data-testid="stVerticalBlockBorderWrapper"]{
-        background:#ffffff; border:1px solid #e4e9f6; border-radius:16px;
-        box-shadow:0 2px 12px rgba(31,42,90,.06); padding:.55rem .55rem;
-      }
-      [data-testid="stWidgetLabel"] p { font-weight:600; color:#41496b; }
-      [data-baseweb="input"] input, [data-baseweb="select"] > div, .stDateInput input{
-        border-radius:10px !important;
-      }
-      .stButton > button{
-        border-radius:10px; font-weight:600; padding:.5rem 1.05rem; border:1px solid #d4dbf0;
-        transition:transform .12s ease, box-shadow .12s ease;
-      }
-      .stButton > button:hover{ transform:translateY(-1px); box-shadow:0 4px 14px rgba(31,42,90,.12); }
-      .stButton > button[kind="primary"]{
-        background:linear-gradient(135deg,#2a3a7a,#1f2a5a); border:none; color:#fff;
-      }
-      .stDownloadButton > button{
-        border-radius:10px; font-weight:600; border:1px solid #d4dbf0;
-      }
-      hr { border-color:#e0e6f4; }
-      [data-testid="stDataFrame"]{ border-radius:12px; overflow:hidden; border:1px solid #e4e9f6; }
-      [data-testid="stAlert"]{ border-radius:12px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# visual theme — see ui_theme.py (look only, no behaviour)
+ui_theme.apply_theme()
 
 # --------------------------------------------------------------------------- #
 #  Session state
@@ -819,11 +758,12 @@ def sync_preview_from_grid(records):
 #  Header
 # --------------------------------------------------------------------------- #
 total_bas = sum(len(v) for v in A["ba_by_owner_client"].values())
-hc1, hc2 = st.columns([1, 4], vertical_alignment="center")
-if os.path.exists(LOGO_FILE):
-    hc1.image(LOGO_FILE, width=130)
-hc2.title("Donation Entry — One-Off")
-hc2.caption(f"{A['owner_count']} owners · {total_bas:,} BAs · source: Google Sheets")
+ui_theme.render_header(
+    "Donation Entry — One-Off",
+    f"{A['owner_count']} owners · {total_bas:,} BAs · source: Google Sheets",
+    logo_path=LOGO_FILE,
+)
+ui_theme.reminder_popup("Please fill the correct data", seconds=4)
 
 # ---- 1) Owner Code ----
 owner_label = st.selectbox(
@@ -887,12 +827,41 @@ if code and not passcode_ok:
         unsafe_allow_html=True,
     )
 
+@st.dialog("Confirm SignIn Date")
+def confirm_signin_dialog(picked):
+    """Asks the owner to double-check the SignIn Date they just picked.
+    Yes → the rest of the form opens; No → the date is cleared to pick again."""
+    st.markdown(
+        f'<div class="ui-confirm-date"><span>Is this the correct SignIn Date?</span>'
+        f'<b>{picked.strftime("%A, %d %B %Y")}</b></div>',
+        unsafe_allow_html=True,
+    )
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("✅ Yes, it's correct", type="primary", use_container_width=True, key="signin_yes"):
+        st.session_state.signin_confirmed = picked
+        st.rerun()
+    if no_col.button("✕ No, change it", use_container_width=True, key="signin_no"):
+        st.session_state.signin_confirmed = None
+        # a fresh key = a brand-new, empty date box (just resetting the old one's
+        # value can leave the previous date showing in the browser until it loses focus)
+        st.session_state.pop(f"signin_{st.session_state.signin_nonce}", None)
+        st.session_state.signin_nonce += 1
+        st.rerun()
+
+
 with st.container(key="entry_form"):
     # ---- 2) SignIn Date ----
-    signin = st.date_input("2 · SignIn Date *", value=None, format="YYYY-MM-DD", key="signin")
+    st.session_state.setdefault("signin_nonce", 0)  # bumped by "No" in the confirm popup
+    signin = st.date_input("2 · SignIn Date *", value=None, format="YYYY-MM-DD",
+                           key=f"signin_{st.session_state.signin_nonce}")
+    signin_ok = bool(signin) and st.session_state.get("signin_confirmed") == signin
+    if signin and not signin_ok and not (code and not passcode_ok):
+        confirm_signin_dialog(signin)
 
     if not signin:
         st.info("Select the **SignIn Date** above to continue.")
+    elif not signin_ok:
+        st.info("Please confirm the **SignIn Date** in the popup to continue.")
     else:
         # ---- NO Production ----
         no_production = st.checkbox(
