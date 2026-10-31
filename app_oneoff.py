@@ -827,7 +827,8 @@ if code and not passcode_ok:
         unsafe_allow_html=True,
     )
 
-@st.dialog("Confirm SignIn Date")
+# not dismissible: no ×, Esc or outside-click — the owner must answer Yes or No
+@st.dialog("Confirm SignIn Date", dismissible=False)
 def confirm_signin_dialog(picked):
     """Asks the owner to double-check the SignIn Date they just picked.
     Yes → the rest of the form opens; No → the date is cleared to pick again."""
