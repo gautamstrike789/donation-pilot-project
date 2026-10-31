@@ -85,6 +85,10 @@ DONATIONS_SHEET_KEY = "oneoff_donations_sheet_id"
 HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Clients", "DonAmt", "Supports",
            "SOD", "Event Name", "Mode of Payment", "No Production", "Timestamp"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Roadtrip", "Telesales"]
+ROADTRIP = "Roadtrip"
+ROADTRIP_TYPES = ["RT B2B", "RT D2D", "RT Streets"]
+# what can land in the SOD column — "Roadtrip" is always saved as the RT type picked under it
+SOD_SAVED_VALUES = [s for s in SOD_CATEGORIES if s != ROADTRIP] + ROADTRIP_TYPES
 MODE_OF_PAYMENT = ["Online", "Cheque"]
 SUPPORTS_DIVISOR = 1200
 SUPPORTS_DECIMALS = 2
@@ -764,8 +768,8 @@ def validate_edited_rows(records, timestamp):
             errors.append(f"Row {i}: **BAName** is required.")
         if donamt_v is None or donamt_v <= 0:
             errors.append(f"Row {i}: **DonAmt** must be a number greater than 0.")
-        if not sod_v or sod_v not in SOD_CATEGORIES:
-            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_CATEGORIES)}.")
+        if not sod_v or sod_v not in SOD_SAVED_VALUES:
+            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_SAVED_VALUES)}.")
         elif sod_v == "Events" and not event_v:
             errors.append(f"Row {i}: **Event Name** is required when SOD is Events.")
         if not mop_v or mop_v not in MODE_OF_PAYMENT:
@@ -958,6 +962,7 @@ with st.container(key="entry_form"):
             same_mop_all = st.session_state.get(f"same_mop_all_{n}", False)
             first_rid = st.session_state.rows[0]
             entry1_sod = st.session_state.get(f"sod_{first_rid}")
+            entry1_rt = st.session_state.get(f"rt_{first_rid}")
             entry1_mop = st.session_state.get(f"mop_{first_rid}")
             for idx, rid in enumerate(st.session_state.rows, start=1):
                 with st.container(border=True):
@@ -997,6 +1002,15 @@ with st.container(key="entry_form"):
                             event_name = st.selectbox("Event Name *", A["event_options"], index=None,
                                                       placeholder="Select an event…", key=f"event_{rid}")
 
+                    rt_type = ""
+                    if sod == ROADTRIP:
+                        # follows Entry #1's roadtrip type too when "same SOD" is checked
+                        rt_default_idx = None
+                        if idx > 1 and same_sod_all and entry1_rt in ROADTRIP_TYPES:
+                            rt_default_idx = ROADTRIP_TYPES.index(entry1_rt)
+                        rt_type = st.selectbox("Roadtrip type *", ROADTRIP_TYPES, index=rt_default_idx,
+                                               placeholder="Select a roadtrip type…", key=f"rt_{rid}")
+
                     mop = st.selectbox("Mode of Payment *", MODE_OF_PAYMENT, index=mop_default_idx,
                                        placeholder="Select a mode…", key=f"mop_{rid}")
 
@@ -1006,7 +1020,7 @@ with st.container(key="entry_form"):
                         same_mop_all = sc2.checkbox("Use same Mode of Payment for all entries",
                                                     key=f"same_mop_all_{n}")
 
-                    row_inputs.append((idx, donamt, sod, event_name, mop))
+                    row_inputs.append((idx, donamt, sod, event_name, mop, rt_type))
 
             if to_remove is not None:
                 st.session_state.rows.remove(to_remove)
@@ -1062,7 +1076,7 @@ with st.container(key="entry_form"):
 
                 # validate every entry row
                 valid_rows = []
-                for idx, donamt, sod, event_name, mop in row_inputs:
+                for idx, donamt, sod, event_name, mop, rt_type in row_inputs:
                     donamt = (donamt or "").strip()
                     donamt_v = parse_positive_amount(donamt)
 
@@ -1074,15 +1088,18 @@ with st.container(key="entry_form"):
                         errors.append(f"Entry #{idx}: select a **source of donation**.")
                     elif sod == "Events" and not event_name:
                         errors.append(f"Entry #{idx}: select an **event name**.")
+                    elif sod == ROADTRIP and not rt_type:
+                        errors.append(f"Entry #{idx}: select a **roadtrip type**.")
                     if not mop:
                         errors.append(f"Entry #{idx}: select a **mode of payment**.")
                     if (donamt_v is not None and donamt_v > 0 and sod
-                            and (sod != "Events" or event_name) and mop):
+                            and (sod != "Events" or event_name) and (sod != ROADTRIP or rt_type) and mop):
                         supports = str(compute_supports(donamt_v))
                         valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
                                            "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
                                            "Clients": client or "", "DonAmt": donamt, "Supports": supports,
-                                           "SOD": sod, "Event Name": event_name if sod == "Events" else "",
+                                           # Roadtrip is saved as the RT type picked under it
+                                           "SOD": rt_type if sod == ROADTRIP else sod, "Event Name": event_name if sod == "Events" else "",
                                            "Mode of Payment": mop, "No Production": "0",
                                            # placeholder — validate_edited_rows() sets the real
                                            # value fresh at submit time, this is just staging
@@ -1150,7 +1167,7 @@ with st.container(key="entry_form"):
                         "S.No": st.column_config.NumberColumn("S.No", disabled=True),
                         "DonAmt": st.column_config.NumberColumn("DonAmt", min_value=0.01),
                         "Supports": st.column_config.NumberColumn("Supports", disabled=True),
-                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
+                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_SAVED_VALUES),
                         "Event Name": st.column_config.SelectboxColumn("Event Name", options=A["event_options"]),
                         "Mode of Payment": st.column_config.SelectboxColumn("Mode of Payment", options=MODE_OF_PAYMENT),
                         "No Production": st.column_config.TextColumn("No Production", disabled=True),

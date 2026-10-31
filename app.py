@@ -69,6 +69,10 @@ SERVICE_ACCOUNT_SECTION = "gcp_service_account"
 HEADERS = ["SigninDT", "OWNCODE", "OwnerName", "BAName", "BACode", "Amount(Amt)", "Age", "SOD",
            "Event Name", "Airport Name", "NO Production", "Timestamp"]
 SOD_CATEGORIES = ["B2B/Commercial", "D2D/Resi", "Events", "Streets", "Airport", "Roadtrip"]
+ROADTRIP = "Roadtrip"
+ROADTRIP_TYPES = ["RT B2B", "RT D2D", "RT Streets"]
+# what can land in the SOD column — "Roadtrip" is always saved as the RT type picked under it
+SOD_SAVED_VALUES = [s for s in SOD_CATEGORIES if s != ROADTRIP] + ROADTRIP_TYPES
 IST = timezone(timedelta(hours=5, minutes=30))
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -721,8 +725,8 @@ def validate_edited_rows(records, timestamp):
             errors.append(f"Row {i}: **Amount(Amt)** must be 499 or more.")
         if age_v is None or not (24 < age_v < 100):
             errors.append(f"Row {i}: **Age** must be a whole number between 25 and 99.")
-        if not sod_v or sod_v not in SOD_CATEGORIES:
-            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_CATEGORIES)}.")
+        if not sod_v or sod_v not in SOD_SAVED_VALUES:
+            errors.append(f"Row {i}: **SOD** must be one of {', '.join(SOD_SAVED_VALUES)}.")
         elif sod_v == "Events" and not event_v:
             errors.append(f"Row {i}: **Event Name** is required when SOD is Events.")
         elif sod_v == "Airport" and not airport_v:
@@ -945,7 +949,12 @@ with st.container(key="entry_form"):
                         airport_name = st.selectbox("Airport Name *", A["airport_options"], index=None,
                                                     placeholder="Select an airport…", key=f"airport_{rid}")
 
-                    row_inputs.append((idx, amt, age, sod, event_name, airport_name))
+                    rt_type = ""
+                    if sod == ROADTRIP:
+                        rt_type = st.selectbox("Roadtrip type *", ROADTRIP_TYPES, index=None,
+                                               placeholder="Select a roadtrip type…", key=f"rt_{rid}")
+
+                    row_inputs.append((idx, amt, age, sod, event_name, airport_name, rt_type))
 
             if to_remove is not None:
                 st.session_state.rows.remove(to_remove)
@@ -998,7 +1007,7 @@ with st.container(key="entry_form"):
 
                 # validate every donation row
                 valid_rows = []
-                for idx, amt, age, sod, event_name, airport_name in row_inputs:
+                for idx, amt, age, sod, event_name, airport_name, rt_type in row_inputs:
                     amt = (amt or "").strip()
                     age = (age or "").strip()
                     try:
@@ -1019,12 +1028,17 @@ with st.container(key="entry_form"):
                         errors.append(f"Donation #{idx}: select an **event name**.")
                     elif sod == "Airport" and not airport_name:
                         errors.append(f"Donation #{idx}: select an **airport**.")
+                    elif sod == ROADTRIP and not rt_type:
+                        errors.append(f"Donation #{idx}: select a **roadtrip type**.")
                     if (amt_v is not None and amt_v >= 499 and age_v is not None and 24 < age_v < 100 and sod
-                            and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)):
+                            and (sod != "Events" or event_name) and (sod != "Airport" or airport_name)
+                            and (sod != ROADTRIP or rt_type)):
                         owner_name = A["owner_meta"].get(code, ("", ""))[0]
                         valid_rows.append({"SigninDT": signin.strftime("%Y-%m-%d"), "OWNCODE": code,
                                            "OwnerName": owner_name, "BAName": effective_ba, "BACode": row_code,
-                                           "Amount(Amt)": amt, "Age": age, "SOD": sod,
+                                           "Amount(Amt)": amt, "Age": age,
+                                           # Roadtrip is saved as the RT type picked under it
+                                           "SOD": rt_type if sod == ROADTRIP else sod,
                                            "Event Name": event_name, "Airport Name": airport_name,
                                            "NO Production": "0",
                                            # placeholder — validate_edited_rows() sets the real
@@ -1091,7 +1105,7 @@ with st.container(key="entry_form"):
                         "S.No": st.column_config.NumberColumn("S.No", disabled=True),
                         "Amount(Amt)": st.column_config.NumberColumn("Amount(Amt)", min_value=0, step=1),
                         "Age": st.column_config.NumberColumn("Age", min_value=0, max_value=120, step=1, format="%d"),
-                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_CATEGORIES),
+                        "SOD": st.column_config.SelectboxColumn("SOD", options=SOD_SAVED_VALUES),
                         "Airport Name": st.column_config.SelectboxColumn("Airport Name", options=A["airport_options"]),
                         "NO Production": st.column_config.TextColumn("NO Production", disabled=True),
                         "Timestamp": st.column_config.TextColumn("Timestamp", disabled=True),
